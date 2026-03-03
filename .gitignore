@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.d
+*.bin
+*.apk
+*.ipk
+
+# Editor
+.vscode/
+*.swp
+*.swo
+*~
+
+# OpenWrt build tree (use the upstream fork for this)
+openwrt/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firmware extracts (large binary blobs)
+fw_extract/

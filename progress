@@ -1,0 +1,725 @@
+# Photonicat 2 — OpenWrt Upstream Porting Progress
+
+**Goal:** Port vanilla/mainline OpenWrt to the Ariaboard Photonicat 2 (RK3576) as an officially supported upstream device.
+
+---
+
+## Hardware Overview
+
+| Component        | Detail                                                                 |
+|------------------|------------------------------------------------------------------------|
+| SoC              | Rockchip RK3576 (4× Cortex-A72 + 4× Cortex-A53, big.LITTLE)         |
+| Board            | Ariaboard Photonicat 2                                                 |
+| Compatible       | `ariaboard,photonicat2` (factory), `ariaboard,photonicat-2` (OpenWrt) |
+| PMIC             | RK806 on I2C1 @ 0x23, interrupt GPIO0 pin 6                          |
+| Ethernet         | Dual GMAC (rk_gmac-dwmac) — GMAC0 (WAN) + GMAC1 (LAN)              |
+| Ethernet PHYs    | 2× Realtek RTL8211F (PHY ID 0x001cc916), RGMII-RXID                  |
+| Storage          | 116.5 GB eMMC (HS400) + SD card slot                                  |
+| PCIe             | 2× M.2 slots (pcie0 + pcie1 via combphy0/combphy1)                    |
+| Wireless         | WCN6855 WiFi 6E + BT (PCIe M.2 slot 0), `17cb:1103`, ath11k-pci      |
+| Cellular         | Quectel RM520N-GL 5G (`2c7c:0801`), USB QMI raw-ip                    |
+| USB              | USB 2.0 + USB 3.0 (via u2phy0/u2phy1), OTG, GenesysLogic USB2.0 Hub |
+| LEDs             | No front-panel LEDs; power button LED controlled by MCU               |
+| Battery          | Li-ion battery with custom charger managed by MCU                     |
+| Fan              | Active cooling, speed controlled by onboard MCU                       |
+| Console          | UART0 (serial@2ad40000), 1500000 baud                                 |
+| Factory Firmware | PhotonicatWrt 25.02.0-r7618, kernel 6.12.45                           |
+| Our Build        | OpenWrt SNAPSHOT r0-73bfb34, kernel 6.12.74, fully working            |
+| GitHub           | `th3cavalry/openwrt`, branch `add-ariaboard-photonicat-2`             |
+
+---
+
+## Build Environment
+
+| Item             | Detail                                                                |
+|------------------|-----------------------------------------------------------------------|
+| Host OS          | CachyOS (Arch-based, rolling release)                                 |
+| Docker Container | `competent_kapitsa` (Debian 12 — `openwrt-build-env:latest`)         |
+| Workspace        | `/workspace/openwrt` inside container (bind-mounted from host)        |
+| Host Path        | `/home/brandon/Coding/photonicat2/openwrt`                            |
+| Target           | `rockchip/armv8` — Rockchip ARMv8                                     |
+
+---
+
+## Step-by-Step Log
+
+### 1. Environment Setup
+- Cloned the mainline OpenWrt repository (shallow clone).
+
+### 2. OpenWrt Build System Integration
+- Registered the `ariaboard_photonicat-2` build profile in `target/linux/rockchip/image/armv8.mk`:
+  - Uses `$(Device/rk3576)` base (SOC rk3576, KERNEL_LOADADDR 0x43000000).
+  - DEVICE_VENDOR: Ariaboard, DEVICE_MODEL: Photonicat 2.
+  - UBOOT_DEVICE_NAME: generic-rk3576.
+  - No DEVICE_PACKAGES (GMAC + Realtek PHY drivers are built-in `=y`, not modules).
+- Configured `make defconfig` to generate a valid `.config` selecting our new target.
+
+### 3. Base Files Configuration
+- **Network** (`target/linux/rockchip/armv8/base-files/etc/board.d/02_network`):
+  - LAN = `eth1` (GMAC1), WAN = `eth0` (GMAC0)
+  - MAC addresses generated from eMMC CID (`/sys/class/block/mmcblk0/device/cid`)
+  - Placed in the `'eth1' 'eth0'` group alongside armsom,sige7 / friendlyarm,nanopi-r2s / etc.
+
+### 4. Initial Device Tree (DTS) Creation
+- Created the initial kernel patch (`999-arm64-dts-rockchip-rk3576-photonicat-2.patch`).
+- Enabled core peripheral nodes (UART console, PCIe, SDMMC, USB PHYs).
+
+### 5. Toolchain Compilation
+- Compiled OpenWrt host tools (`make tools/install`).
+- Compiled the `aarch64` cross-compiler toolchain (`make toolchain/install`).
+- Tested generic DTS patch application against Linux 6.12 kernel source.
+
+### 6. Factory Firmware Reverse Engineering
+- Extracted boot partition from factory sysupgrade image.
+- Used `debugfs` + `dtc` to decompile the factory DTB → `fw_extract/rockchip.dts` (4531 lines).
+- Analyzed factory DTS to reverse-engineer precise hardware wiring.
+
+### 7. Hardware Mapping Refinement (PCIe & Power)
+- Located power regulators and GPIO pin mappings for dual M.2 PCIe slots (`pcie0` + `pcie1`).
+- Identified I2C buses and UART serial ports for internal devices.
+- Rewrote DTS patch with exact `pinctrl`, `vpcie3v3-supply`, and `reset-gpios` values from factory firmware.
+
+### 8. Ethernet Mapping Refinement
+- Identified pinmux groups: `eth0m1` for GMAC0, `eth1m0` for GMAC1.
+- Identified PHY reset GPIOs: `GPIO0_D2` (GMAC0) and `GPIO0_D3` (GMAC1).
+- Configured MDIO buses and PHY nodes with 25MHz reference clocks (`REFCLKO25M_GMAC0_OUT`/`REFCLKO25M_GMAC1_OUT`).
+
+### 9. Build Environment Migration (Docker)
+- Encountered GLIBC 2.38 mismatch from building on bleeding-edge host then running in standard environment.
+- Created `Dockerfile.openwrt` (Debian 12) to encapsulate the build.
+- Cleaned all cached artifacts and initiated full rebuild inside Docker.
+
+### 10. U-Boot & Final Image Generation
+- Added `ariaboard_photonicat-2` to the U-Boot rockchip `generic-rk3576` build target.
+- Fixed missing `swig` and `python3-pyelftools` dependencies for U-Boot Python wrapper.
+- Successfully generated `sysupgrade.img.gz` bootable images.
+
+### 11. SD Card Boot Priority Workaround
+- RK3576 prioritizes eMMC over SD card by default.
+- Integrated the ImmortalWrt `rk3576-boost.bin` workaround into U-Boot to force SD card boot priority.
+
+### 12. Ethernet GMAC Fix (First Boot Failure)
+- **Problem:** Neither Ethernet port came up on first boot — the base `rk3576.dtsi` has both GMACs `status = "disabled"` and our DTS only declared aliases without overriding the nodes.
+- **Fix:** Added complete `&gmac0`, `&gmac1`, `&mdio0`, `&mdio1` node overrides with full configuration reverse-engineered from factory firmware.
+
+### 13. Live Device Investigation (SSH to Factory Firmware)
+- Established SSH to the Photonicat 2 running factory firmware at `172.16.0.1` (password `photonicat`).
+- Gathered comprehensive live hardware data via SSH:
+  - Confirmed model `Ariaboard photonicat2` with compatible `ariaboard,photonicat2`.
+  - Confirmed `eth0` = WAN (NO-CARRIER/down), `eth1` = LAN (UP, 1000Mb/s full-duplex, connected to our PC).
+  - Confirmed PHY IDs: both `0x001cc916` (RTL8211F) on their respective MDIO buses.
+  - Both use `rk_gmac-dwmac` driver.
+  - Full GPIO dump, regulator list, thermal zones, rfkill nodes.
+  - All DT aliases confirmed matching expected serial/mmc/ethernet mappings.
+
+### 14. DTS Corrections Based on Live Data
+Based on SSH data from the live device, made these corrections:
+
+1. **PHY compatible string:** Changed from generic `ethernet-phy-ieee802.3-c22` to specific `ethernet-phy-id001c.c916` (based on confirmed PHY ID `0x001cc916`).
+2. **GMAC pinctrl cleanup:** Removed `&gmac0_rst` / `&gmac1_rst` from GMAC `pinctrl-0` arrays. The reset pin belongs only on the PHY node's `reset-gpios`, not in the GMAC's pinmux. This follows the upstream Rock 4D pattern (only other RK3576 board with GMAC in mainline).
+3. **LAN/WAN swap:** Factory firmware uses `eth1` = LAN, `eth0` = WAN. Fixed `02_network` to place `ariaboard,photonicat-2` in the `'eth1' 'eth0'` (LAN WAN) group.
+4. **LED swap:** Fixed `01_leds` to match: WAN LED → `eth0`, LAN LED → `eth1`.
+5. **Removed kmod-r8169:** Removed incorrect `DEVICE_PACKAGES := kmod-r8169` from image profile. The Ethernet uses built-in GMAC (`CONFIG_DWMAC_ROCKCHIP=y`) and built-in Realtek PHY (`CONFIG_REALTEK_PHY=y`), not a PCIe NIC.
+
+### 15. Factory Firmware pcat_manager Investigation
+Investigated the factory firmware's custom `pcat_manager` ecosystem to check for missing functionality:
+
+#### Custom Kernel Drivers (NOT in mainline Linux)
+
+1. **`photonicat-pm`** — Serial bus driver on UART10 (`serial@2afc0000`) at 115200 baud:
+   - Communicates with onboard MCU via custom serial protocol
+   - Provides: RTC (`rtc0`), hwmon (motherboard temperature `temp_mb`, fan speed `fan_speed`), power button, accelerometer (gs_x/gs_y/gs_z, movement_trigger), battery/charger interface
+   - Config: `CONFIG_PHOTONICAT_PM=y` (built-in, not mainline)
+   - DT properties: `pm-version = <2>`, `power-gpio = <&gpio0 RK_PC1>`, `baudrate = <115200>`, `force-poweroff-timeout = <60>`
+   - Sub-nodes: `fan {}`, `charger { monitored-battery = <&battery>; }`
+
+2. **`pcat-usb-watchdog`** — USB hub stability monitor:
+   - Monitors GenesysLogic USB2.0 Hub (VID `0x05e3`, PID `0x0610`)
+   - Resets USB hub via `gpio3 RK_PB0` (active-low) if hub disappears
+   - Config: `CONFIG_PHOTONICAT_USB_WDT=y` (built-in, not mainline)
+   - DT properties: `reset-gpios`, `target-vid`, `target-pid`, `reset-ms = <50>`, `scan-interval = <15000>`
+
+#### Custom Userspace Daemons
+
+| Package               | Version    | Description                                       |
+|-----------------------|------------|---------------------------------------------------|
+| pcat-manager          | 2.0.0-31   | Main daemon — controls modem power/APN, battery thresholds, fan, LED status, shutdown voltage |
+| pcat-manager-web      | 2.2.1-92   | Python web management interface                   |
+| pcat2-display-mini    | 1.0.0-34   | Mini display driver                               |
+
+Config file: `/etc/pcat-manager.conf` (PowerManager settings: under-voltage thresholds, LED voltages, auto-shutdown voltages).
+
+#### Factory DT Nodes NOT in Our DTS
+
+**Can add (use standard mainline drivers):**
+
+| Node                    | Driver         | GPIO / Details                                    |
+|-------------------------|----------------|---------------------------------------------------|
+| `vcc_12v0_dcin`         | regulator-fixed | 12V DC input (parent of vcc_5v0_sys)              |
+| `vcc_5v0_device`        | regulator-fixed | 5V device rail (from 12V DCIN)                    |
+| `vcc5v0-usb-switch`     | regulator-fixed | gpio0 RK_PC2, USB hub power switch                |
+| `vcc5v0-otg`            | regulator-fixed | gpio4 RK_PC4, USB OTG power                       |
+| `rfkill-pcie-wlan`      | rfkill-gpio    | gpio0 RK_PD1 shutdown — PCIe WiFi power control   |
+| `rfkill-pcie-bluetooth` | rfkill-gpio    | gpio0 RK_PD0 shutdown — PCIe BT power control     |
+| `rfkill-usb-wlan`       | rfkill-gpio    | gpio1 RK_PC6 shutdown — USB WiFi power control    |
+| `rfkill-usb-wwan`       | rfkill-gpio    | gpio0 RK_PC0 shutdown + gpio0 RK_PB7 reset — 5G modem |
+
+**Cannot add (require custom non-mainline kernel drivers):**
+
+| Node             | Driver            | Purpose                                          |
+|------------------|-------------------|--------------------------------------------------|
+| `pcat-pm`        | photonicat-pm     | MCU serial bus: RTC, fan, temp, power, accel, charger |
+| `pcat-usb-wdt`   | pcat-usb-watchdog | USB hub watchdog/reset                            |
+
+**Not critical for upstream (multimedia/display):**
+
+| Node        | Driver         | Purpose                           |
+|-------------|----------------|-----------------------------------|
+| `battery`   | simple-battery | Li-ion battery (only useful with pcat-pm charger) |
+| `backlight` | pwm-backlight  | Attached display backlight        |
+
+#### pcat_manager Conclusion
+- **None of the pcat_manager components affect basic Ethernet/routing functionality.**
+- The rfkill-gpio and USB regulator nodes CAN be added using standard mainline drivers and would enable WiFi/BT/WWAN power control and USB power management.
+- The pcat-pm and pcat-usb-wdt kernel drivers are proprietary/non-mainline — they would need to be upstreamed or carried as OpenWrt patches for full device support (fan control, battery, RTC, etc.).
+
+### 16. Firmware Rebuild & Flash
+- Successfully rebuilt firmware inside Docker container with all fixes.
+- Flashed 176 MB image to SD card (`/dev/mmcblk0`).
+
+---
+
+## DTS Summary (608 lines)
+
+Source: `openwrt/tmp/rk3576-photonicat-2.dts`
+Patch: `openwrt/target/linux/rockchip/patches-6.12/999-arm64-dts-rockchip-rk3576-photonicat-2.patch`
+
+### Nodes Enabled
+
+| Node               | Purpose                           | Key Config                                          |
+|--------------------|-----------------------------------|-----------------------------------------------------|
+| Fixed regulators   | 6× board-level power rails        | vcc_5v0_sys, vcc_3v3_sys, vcc3v3_pcie0/1, vcc3v3_sd, vcc5v0_host |
+| `&i2c1` (RK806)    | Full PMIC with 21 sub-regulators | Address 0x23, interrupt GPIO0_A6                     |
+| `&gmac0`           | Ethernet WAN                     | eth0m1 pinmux, rgmii-rxid, tx_delay 0x20            |
+| `&gmac1`           | Ethernet LAN                     | eth1m0 pinmux, rgmii-rxid, tx_delay 0x20            |
+| `&mdio0` / `&mdio1` | MDIO buses + PHY nodes          | RTL8211F @ addr 1, phy-id 001c.c916, reset GPIOs    |
+| `&combphy0_ps`     | PCIe 0 combo PHY                 | PHY type PCIe                                        |
+| `&combphy1_psu`    | PCIe 1 combo PHY                 | PHY type PCIe                                        |
+| `&pcie0`           | M.2 PCIe slot 0                  | vpcie3v3, reset GPIO4_PA2                            |
+| `&pcie1`           | M.2 PCIe slot 1                  | vpcie3v3, reset GPIO3_PD0                            |
+| `&sdhci`           | eMMC                             | HS400, non-removable, 8-bit                          |
+| `&sdmmc`           | SD card                          | SD HS, 4-bit, cd-gpios                               |
+| `&saradc`          | ADC                              | vref 1.8V                                            |
+| `&uart0`           | Serial console                   | 1500000 baud                                         |
+| `&u2phy0` / `&u2phy1` | USB 2.0 PHYs                 | Host + OTG ports                                     |
+| `&pinctrl`         | GPIO pin groups                  | gmac0_rst, gmac1_rst, pcie0_rst, pcie1_rst, etc.    |
+| Display            | GC9307 172×320 TFT LCD          | SPI1.0, GPIO chardev (DC/RST/BL)                     |
+
+---
+
+## Issues Encountered & Resolved
+
+### Patch File Formatting Errors
+The standard `patch` utility is strict about trailing newlines and line-count headers. Manual edits caused "unexpected end of file" and "malformed patch" errors.
+- **Resolution:** Created `create_patch.py` — calculates exact line counts and generates a perfectly formatted `.patch` file.
+
+### Host OS GLIBC Mismatch
+Building on CachyOS (rolling release) compiled binaries against `GLIBC_2.38`. Running inside a more stable environment triggered `version 'GLIBC_2.38' not found`.
+- **Resolution:** Wiped artifacts and migrated to a controlled Debian 12 Docker container (`Dockerfile.openwrt`).
+
+### DTS Trailing Newline Requirement
+The Linux 6.12 `dtc` parser threw a syntax error at the end of our `.dts` file.
+- **Resolution:** The `dtc` parser requires a trailing empty line at the end of `.dts` files.
+
+### U-Boot Missing Host Tools
+U-Boot silently crashed building its Python wrapper without `swig` and `python3-pyelftools`.
+- **Resolution:** Added dependencies to Dockerfile, cleared broken build state, rebuilt.
+
+### SD Card Boot Priority
+The RK3576 prioritizes eMMC over SD card, ignoring our flashed SD.
+- **Resolution:** Applied ImmortalWrt `rk3576-boost.bin` workaround to U-Boot.
+
+### No Ethernet on First Boot
+GMACs were `status = "disabled"` in base dtsi; our DTS only declared aliases without node overrides.
+- **Resolution:** Added complete `&gmac0` / `&gmac1` / `&mdio0` / `&mdio1` overrides with full PHY config.
+
+### create_patch.py f-string Syntax Error
+An f-string contained a literal newline, causing `SyntaxError: unterminated f-string literal`.
+- **Resolution:** Replaced with standard string concatenation.
+
+### Incorrect DEVICE_PACKAGES
+Image profile had `kmod-r8169` (PCIe NIC driver), but the board uses built-in GMAC + PHY.
+- **Resolution:** Removed `DEVICE_PACKAGES` entirely since `CONFIG_DWMAC_ROCKCHIP=y` and `CONFIG_REALTEK_PHY=y` are already built-in.
+
+### GMAC Pinctrl Had Redundant Reset Pins
+`&gmac0_rst` / `&gmac1_rst` were in both GMAC `pinctrl-0` AND PHY `reset-gpios`, which is incorrect.
+- **Resolution:** Removed from GMAC `pinctrl-0` (reset belongs only on PHY node). Follows upstream Rock 4D pattern.
+
+### PHY Compatible String Too Generic
+Used `ethernet-phy-ieee802.3-c22` which is overly generic for known hardware.
+- **Resolution:** Changed to `ethernet-phy-id001c.c916` based on live PHY ID `0x001cc916` from factory device.
+
+### UART10 GPIO Pin Conflict (pcat-pm timeouts)
+Default `uart10m0_xfer` pinmux routes UART10 to GPIO3_PB0/PB1. GPIO3_PB0 is also used as the USB hub reset GPIO hog (active-low), creating a bus conflict. The MCU received no serial data and the driver spammed "Status report timeout!".
+- **Resolution:** Changed `pinctrl-0 = <&uart10m2_xfer>` routing UART10 to GPIO0_PC4/PC5 (confirmed from official Ariaboard DTS).
+
+### Stale Image (Old DTB on SD Card)
+When extracting the image, the `.img` file on disk was from a previous build (Feb 28). The fresh build output was `.img.gz` — decompressing to get `.img` was required before flashing.
+- **Resolution:** Always use `gunzip -kf *.img.gz` then `dd` with the resulting `.img`.
+
+### QMI "Call failed" on T-Mobile 5G SA
+After reflash, restoring `pdptype=ipv4` caused all `uqmi --start-network` attempts to return `"Call failed"`. T-Mobile 5G SA assigns IPv6-only on initial PDU session attach; the modem refused IPv4-only data calls because its active session was already IPv6.
+- **Resolution:** Configure `AT+CGDCONT=1,"IPV4V6","fast.t-mobile.com"` on the modem + `pdptype=ipv4v6` in UCI.
+
+### nftables TTL Include Conflicts with fw4 Chain Names
+The TTL rules file used `chain mangle_postrouting { }` — fw4 includes user `.nft` files before declaring its own same-named chain. The bare chain (no type/hook) was created first, then fw4's typed definition failed with "Chain of type 'filter' is not supported". This prevented the **entire firewall** from loading — no NAT, no forwarding.
+- **Resolution:** Renamed to `chain wwan_ttl_postrouting` with its own `type filter hook postrouting priority mangle + 1` — completely avoids fw4 chain name collisions.
+
+---
+
+## File Inventory
+
+| File | Purpose |
+|------|---------|
+| `create_patch.py` | Generates kernel DTS patch from source DTS file |
+| `Dockerfile.openwrt` | Debian 12 build environment for OpenWrt |
+| `fw_extract/rockchip.dts` | Decompiled factory firmware DTB (4531 lines, reference) |
+| `fw_extract/rockchip.dtb` | Extracted factory DTB binary |
+| `openwrt/tmp/rk3576-photonicat-2.dts` | Our DTS source file (~828 lines) |
+| `openwrt/target/linux/rockchip/patches-6.12/998-staging-photonicat-pm-add-driver.patch` | pcat-pm MCU serial driver (1566 lines, from Ariaboard GitHub) |
+| `openwrt/target/linux/rockchip/patches-6.12/999-arm64-dts-rockchip-rk3576-photonicat-2.patch` | Kernel DTS patch (generated by create_patch.py) |
+| `openwrt/target/linux/rockchip/armv8/config-6.12` | Kernel config additions (CONFIG_STAGING=y, CONFIG_PHOTONICAT_PM=m) |
+| `openwrt/target/linux/rockchip/image/armv8.mk` | Build profile registration + DEVICE_PACKAGES |
+| `openwrt/target/linux/rockchip/armv8/base-files/etc/board.d/01_leds` | LED configuration |
+| `openwrt/target/linux/rockchip/armv8/base-files/etc/board.d/02_network` | Network interface assignment |
+| `openwrt/package/kernel/linux/modules/other.mk` | KernelPackage/photonicat-pm package definition |
+| `openwrt/package/luci-app-photonicat/` | Custom LuCI hardware status page (in progress) |
+
+---
+
+## Reference Boards
+
+| Board | Relevance |
+|-------|-----------|
+| NanoPi R76S (`friendlyarm,nanopi-r76s`) | Full RK3576 PMIC in mainline, no GMAC yet |
+| Rock 4D (`radxa,rock-4d`) | Only RK3576 board with GMAC0 in mainline (uses eth0m0 mux) |
+
+---
+
+### 17. WiFi — WCN6855 (ath11k-pci)
+- PCIe M.2 slot 0 contains a Qualcomm WCN6855 WiFi+BT module (`17cb:1103`).
+- Driver: `ath11k-pci` loaded automatically via `kmod-ath11k-pci`.
+- Fixed **modem GPIO hogs** in DTS — factory DTS had `gpio3 RK_PB0` and `gpio3 RK_PB1` hogged (active-low) which caused a PCIe bus conflict. Removed the conflicting hogs.
+- Added `DEVICE_PACKAGES`: `ath11k-firmware-wcn6855 kmod-ath11k-pci wpad-basic-mbedtls`.
+- **Result:** WiFi working, WPA2/3 AP mode functional.
+
+### 18. pcat-pm Driver — Battery, Fan, Temperature, RTC, SPI Display
+
+#### Background
+The Photonicat 2 has an onboard MCU (connected via UART10) that manages the battery, charger, fan, power button, and RTC. The factory firmware carries a custom staging driver `photonicat-pm` that implements the binary serial protocol.
+
+#### Kernel Patch
+Created `openwrt/target/linux/rockchip/patches-6.12/998-staging-photonicat-pm-add-driver.patch` (1566 lines):
+- Copied from official Ariaboard/Photonicat GitHub repo.
+- Adds `drivers/staging/photonicat-pm/photonicat-pm.c` — a serdev driver running at 115200 baud.
+- Exposes: `power_supply` (battery + charger), `hwmon` (temp + fan RPM), `thermal_cooling_device` (fan), `rtc` (RTC0), `misc` device (`/dev/pcat-pm-ctl`).
+
+#### DTS Changes (patch 999)
+- Added `&battery` node (Li-ion, 51.8 Wh, OCV table from 6.8V–8.4V).
+- Added `&uart10` override with:
+  - `pinctrl-0 = <&uart10m2_xfer>` — routes UART10 to **GPIO0_PC4/PC5** (critical fix — default `uart10m0_xfer` uses GPIO3_PB0 which conflicts with the USB hub reset GPIO hog).
+  - Child node `pcat-pm` (serdev device, baudrate 115200).
+- Added `&spi1` with `spidev@0` for the GC9307 172×320 display (spi1m2 pinmux).
+- Added `&i2c6` (RTC backup).
+
+#### Kernel Config Changes (`config-6.12`)
+```
+CONFIG_STAGING=y
+CONFIG_PHOTONICAT_PM=m
+```
+
+#### Package Definition (`package/kernel/linux/modules/other.mk`)
+Added `KernelPackage/photonicat-pm`:
+- `DEPENDS`: `@TARGET_rockchip_armv8`
+- `KCONFIG`: `CONFIG_STAGING=y CONFIG_PHOTONICAT_PM`
+- Auto-loads `photonicat-pm` module.
+
+#### Added to Device Packages (`armv8.mk`)
+```makefile
+DEVICE_PACKAGES := ath11k-firmware-wcn6855 kmod-ath11k-pci \
+    kmod-photonicat-pm kmod-usb-net-qmi-wwan kmod-usb-serial-option \
+    luci-proto-qmi uqmi wpad-basic-mbedtls
+```
+
+#### Debugging: UART10 Pin Conflict
+- **1st boot:** Module loaded, no power_supply nodes. Root cause: image was stale (old `.img` not `.img.gz`).
+- **2nd boot (correct image):** Driver loaded but spammed "Status report timeout!" — MCU not responding.
+  - Root cause: `uart10m0_xfer` pinmux (GPIO3_PB0/PB1) conflicts with USB hub reset GPIO hog on GPIO3_PB0.
+  - **Fix:** `pinctrl-0 = <&uart10m2_xfer>` maps UART10 to GPIO0_PC4/PC5 (confirmed from official DTS).
+- **3rd boot:** Everything working.
+
+#### Verified Working Sensors (live device)
+
+| Subsystem | sysfs path | Live reading |
+|-----------|-----------|--------------|
+| Battery capacity | `/sys/class/power_supply/battery/capacity` | 84% |
+| Battery status | `/sys/class/power_supply/battery/status` | Charging |
+| Battery voltage | `/sys/class/power_supply/battery/voltage_now` | ~7.9V |
+| Battery current | `/sys/class/power_supply/battery/current_now` | ~659mA |
+| Charger online | `/sys/class/power_supply/charger/online` | 1 |
+| Charger voltage | `/sys/class/power_supply/charger/voltage_now` | ~4.6V |
+| Fan RPM | `/sys/class/hwmon/hwmon10/fan1_input` (pcat_pm_hwmon_speed_fan) | 0 RPM (idle) |
+| Board temp | `/sys/class/hwmon/hwmon9/temp1_input` (pcat_pm_hwmon_temp_mb) | ~45°C |
+| RTC | `/dev/rtc0` | Working |
+| SPI display | `/dev/spidev1.0` | Device present |
+| MCU control | `/dev/pcat-pm-ctl` | Device present |
+
+Other hwmon sensors (all from RK3576 SoC thermal zones):
+
+| hwmon | name | temp |
+|-------|------|------|
+| hwmon0 | nvme | ~40°C |
+| hwmon1 | package_thermal | ~52°C |
+| hwmon2 | bigcore_thermal | ~52°C |
+| hwmon3 | littlecore_thermal | ~53°C |
+| hwmon4 | gpu_thermal | ~52°C |
+| hwmon5 | npu_thermal | ~51°C |
+| hwmon6 | ddr_thermal | ~53°C |
+
+---
+
+### 19. Cellular Data (Quectel RM520N-GL, T-Mobile 5G NR)
+
+**Modem:** Quectel RM520N-GL (`2c7c:0801`), USB QMI mode, T-Mobile 5G NR Band n41 (MCC 310, MNC 260).
+
+#### Issue: "Call failed" on uqmi --start-network
+After a fresh reflash the QMI config was lost. Restoring with `pdptype=ipv4` failed — every `uqmi --start-network` returned `"Call failed"`.
+
+**Diagnosis via AT commands (`/dev/ttyUSB3`):**
+- `AT+C5GREG?` → `0,1` (registered on 5G NR home)
+- `AT+CEREG?` → `0,0` (not registered on LTE — expected on 5G SA)
+- `AT+CGACT?` → `1,1` (PDP context 1 already **active** internally)
+- `AT+CGPADDR=1` → returned an **IPv6 address**, not IPv4
+
+**Root cause:** T-Mobile 5G SA (standalone NR) only assigns IPv6 on initial PDU session attach. The modem had PDP context 1 typed as `"IP"` (IPv4 only). After uqmi `--modify-profile` set it to `ipv4` too, the modem refused IPv4 data calls because its active session was IPv6.
+
+**Fix:**
+1. `AT+CGDCONT=1,"IPV4V6","fast.t-mobile.com"` — persisted in modem NVRAM.
+2. `uqmi --modify-profile "3gpp,1" --apn "fast.t-mobile.com" --pdp-type "ipv4v6"`
+3. UCI: `pdptype=ipv4v6` (was `ipv4`).
+
+**UCI config (`/etc/config/network`):**
+```
+config interface 'wwan'
+    option proto 'qmi'
+    option device '/dev/cdc-wdm0'
+    option apn 'fast.t-mobile.com'
+    option pdptype 'ipv4v6'
+    option profile '1'
+    option dhcpv6 '1'
+    option delegate '0'
+    option metric '100'
+```
+
+**Result:**
+- IPv4: `192.0.0.2/27`, gateway `192.0.0.1` — ping 8.8.8.8 ~50ms.
+- IPv6: `2607:fb90::/64` — ping 2001:4860:4860::8888 ~46ms.
+- DNS: both A and AAAA resolving.
+
+---
+
+### 20. LuCI QMI Protocol Page (luci-proto-qmi)
+
+`luci-proto-qmi` was not in the online snapshot repository packages.
+
+**Manual install:** Copied `feeds/luci/protocols/luci-proto-qmi/htdocs/luci-static/resources/protocol/qmi.js` to `/www/luci-static/resources/protocol/qmi.js` on the device.
+
+**Build integration:** Added `luci-proto-qmi` to `DEVICE_PACKAGES` in `armv8.mk`.
+
+**LuCI now shows "QMI Cellular" protocol for the wwan interface with fields for:**
+- Modem device, APN, IPv6 APN
+- PDP Type (IPv4/IPv6/IPv4+IPv6)
+- PIN code, authentication (PAP/CHAP)
+- MTU override, gateway metric, profile index, DNS settings
+
+---
+
+### 21. TTL/HL Mangling (nftables)
+
+Added TTL/Hop-Limit mangling rules to prevent carrier detection of tethered traffic.
+
+**File:** `/etc/nftables.d/90-wwan-ttl.nft`
+
+```nft
+chain wwan_ttl_postrouting {
+  type filter hook postrouting priority mangle + 1; policy accept;
+  oifname "wwan0" ip ttl set 65
+  oifname "wwan0" ip6 hoplimit set 65
+}
+```
+
+Sets outgoing TTL/HL to 65 on the wwan0 interface (appears as 64 to the carrier after one hop — indistinguishable from a single device).
+
+**Note on chain naming:** Uses a dedicated chain name `wwan_ttl_postrouting` with its own hook at `priority mangle + 1`. Do NOT use `chain mangle_postrouting` — that would conflict with fw4's own chain definition (see issue below).
+
+---
+
+### 22. Firewall Fix — nftables Include Conflict
+
+**Symptom:** LAN-connected devices showed "limited connection" / no internet despite the Photonicat itself having full connectivity. Clients got DHCP leases but no packets were routed or NAT-masqueraded.
+
+**Root cause:** The TTL rules file (`/etc/nftables.d/90-wwan-ttl.nft`) originally used `chain mangle_postrouting { ... }` — a bare chain with rules but no type/hook declaration. fw4 includes user `.nft` files at line ~20 inside the `table inet fw4 { }` block, **before** it declares its own `mangle_postrouting` chain (at line ~173). When nft encounters the user file's bare `mangle_postrouting` chain and then fw4's typed `mangle_postrouting` declaration, it fails with:
+
+```
+Error: Chain of type "filter" is not supported, perhaps kernel support is missing?
+    type filter hook postrouting priority mangle; policy accept;
+```
+
+This error prevented the **entire firewall from loading** — no NAT, no forwarding rules, no masquerade.
+
+**Fix:** Changed TTL chain to use a unique name with its own `type filter hook postrouting priority mangle + 1` declaration, completely avoiding any collision with fw4's built-in chain names.
+
+---
+
+## Step 23 — WiFi AP Enable (WCN6855 6GHz)
+
+WiFi was disabled by default (OpenWrt security default). Enabled and configured the 6GHz AP:
+
+- `band=6g`, `channel=33` (6115 MHz), `htmode=HE80`, `country=US`
+- SSID: "Overland x5d", encryption: `sae-mixed` (WPA2/WPA3), key set
+- Note: `channel=auto` (ACS) does NOT work with ath11k on 6GHz — must use a fixed channel
+- TX power capped at 10 dBm by firmware (VLP mode enforcement); acceptable for indoor use
+
+---
+
+## Step 24 — Cellular Reliability Fixes
+
+Several issues fixed to make cellular robust for field use:
+
+**Duplicate wwan in firewall zone:**
+Previously `wan wan6 wwan wwan` — `wwan` appeared twice from earlier config editing.
+Fix: `uci del_list firewall.@zone[1].network=wwan && uci add_list firewall.@zone[1].network=wwan`
+
+**IPv6 not working (T-Mobile 5G SA):**
+- Root cause: `option dhcpv6 '1'` in UCI caused qmi.sh to run `odhcp6c` (DHCPv6 client)
+- T-Mobile 5G SA has no DHCPv6 server — it provides IPv6 directly in the QMI WDS session
+- odhcp6c would send Solicit/RS indefinitely, `wwan_6` would stay `pending=true`
+- Fix: `uci set network.wwan.dhcpv6=0` — qmi.sh now reads IPv6 address directly from
+  `uqmi --get-current-settings` on the IPv6 WDS client (`cid_6`). IPv6 comes up in ~30s after connect.
+- Also needed: `accept_ra=2` on wwan0 (allow RA even when IPv6 forwarding is enabled)
+  Persisted via `/etc/hotplug.d/iface/40-wwan-ipv6` hotplug script
+
+**Cellular reconnect watchdog:**
+Created `/usr/bin/wwan-watchdog` + `/etc/crontabs/root` entry `*/5 * * * * /usr/bin/wwan-watchdog`:
+- Uses a lock file to prevent concurrent runs
+- Checks if wwan0 has a default route; if not, triggers `ifdown wwan; sleep 35; ifup wwan`
+- Pings 8.8.8.8, 1.1.1.1, 9.9.9.9 via wwan0; if all fail, reconnects
+- **Sleep of 35 seconds between ifdown and ifup is important**: the Quectel RM520N-GL's
+  virtual DHCP server (at 192.0.0.1) needs ~30s after QMI session teardown to re-initialize
+  and respond to DHCP Discover packets. Less than 30s → DHCP times out → no IPv4.
+
+**DHCP on reconnect:**
+The modem's DHCP server (at 192.0.0.1 in CarrierGrade NAT 192.0.0.0/27) only responds
+to fresh DHCP Discover after a full data session teardown/re-establish cycle with adequate pause.
+After cold boot: DHCP always works. After ifdown: 30-35s sleep required before ifup.
+
+---
+
+## Hardware Status Summary
+
+| Subsystem | Status | Notes |
+|-----------|--------|-------|
+| Ethernet LAN (eth1/br-lan) | ✅ Working | 1Gbps, 192.168.1.1 |
+| Ethernet WAN (eth0) | ✅ Working | Failover/secondary WAN |
+| PCIe slot 0 (WiFi) | ✅ Working | WCN6855, ath11k_pci, 6GHz ch33 |
+| PCIe slot 1 (NVMe) | ✅ Working | Samsung PM9C1a detected |
+| USB host ports | ✅ Working | GL3510 hub, modem, etc. |
+| 5G Modem (RM520N-GL) | ✅ Working | T-Mobile 5G NR, IPv4+IPv6 |
+| WiFi AP | ✅ Working | "Overland x5d", WPA2/WPA3, 6GHz |
+| Battery monitoring | ✅ Working | capacity, voltage, current, status |
+| Charger monitoring | ✅ Working | online, voltage |
+| Fan monitoring | ✅ Working | RPM via hwmon |
+| Board/SoC temperature | ✅ Working | Multiple thermal zones |
+| RTC | ✅ Working | /dev/rtc0 via pcat-pm |
+| SPI display device | ✅ Working | /dev/spidev1.0 (GC9307 172×320) |
+| MCU control | ✅ Working | /dev/pcat-pm-ctl |
+| NAT / Firewall | ✅ Working | fw4 (nftables) running |
+| TTL/HL mangling | ✅ Working | TTL=65 on wwan0 egress |
+| Cellular watchdog | ✅ Working | cron every 5min, 35s reconnect sleep |
+| IPv4 internet | ✅ Working | 192.0.0.2/27, CGN, default route via wwan0 |
+| IPv6 internet | ✅ Working | 2607:fb90::/128 via QMI direct |
+| LuCI web UI | ✅ Working | https://192.168.1.1 |
+| LuCI QMI protocol page | ✅ Working | luci-proto-qmi installed |
+| Backlight PWM | ⏳ Deferred | Needs 7× PWMv4 kernel patches (GPIO toggle works for now) |
+| Display userspace app | ✅ Working | Custom C app, GC9307 via SPI, shows time/battery/net info |
+
+---
+
+---
+
+## Step 25 — Factory Firmware Image Analysis (In Progress)
+
+Investigating how the factory firmware (PhotonicatWrt 25.02.0-r7618) handles networking, cellular,
+WiFi, and IPv6 — to compare against our own fixes and potentially borrow config patterns.
+
+**Image files extracted** (`fw_extract/`):
+- `fw.img` — 4.2 GB full disk image (MBR partition table, identifier `0x5452574f`)
+- `boot.img` — 64 MB ext2 filesystem (volume name "kernel")
+- `rockchip.dtb` / `rockchip.dts` — factory device tree (already reverse-engineered in Step 6)
+
+**Partition layout of fw.img:**
+```
+Partition 1 (boot): offset 65536 sectors = 32 MB, size 64 MB,  ext4, bootable
+Partition 2 (root): offset 262144 sectors = 128 MB, size 4 GB, ext4
+```
+Note: 32 MB gap at start (sectors 0–65535) is likely the SPL/U-Boot area.
+
+**Loop devices set up** (from current session — not yet mounted/explored):
+```
+/dev/loop0  offset=0          → whole disk (for partition table inspection)
+/dev/loop1  offset=33554432   → partition 1 (boot, 64 MB ext4 kernel volume)
+```
+Partition 2 (rootfs) not yet mounted. That's where all the factory config lives:
+`/etc/config/network`, `/etc/config/wireless`, QMI init scripts, etc.
+
+**Next steps for factory firmware analysis:**
+- Mount partition 2 (rootfs) at `offset=$((262144*512))`
+- Compare `/etc/config/network` — especially QMI `pdptype` / `dhcpv6` settings
+- Compare `/etc/config/wireless` — see how factory handles 6GHz channel selection
+- Look at `/lib/netifd/proto/qmi.sh` version — may have fixes we don't have
+- Check `/etc/hotplug.d/` — how factory handles wwan IPv6 accept_ra
+- Check `/etc/crontabs/root` — any watchdog equivalent
+- Look for `pcat2-display-mini` binary and display config
+- Look for the `pcat-pm` driver / init scripts used for battery/fan API
+
+---
+
+## Current Status
+
+The device is field-ready. All core systems survive clean reboots and automatic reconnect after
+cellular data session drops. Verified: WiFi AP, IPv4 internet, IPv6 internet, firewall/NAT,
+TTL mangling, watchdog cron, firewall zone dedup — all working after cold boot.
+
+5G NR signal (T-Mobile): RSRP=-90 dBm, SNR=20.5 dB, Band n41
+
+## Remaining Work
+
+1. **Factory firmware analysis** — Mount `fw.img` partition 2, read factory `/etc/config/` and scripts to understand/compare their QMI, WiFi, and IPv6 handling.
+2. **LuCI hardware status page** — Custom `luci-app-photonicat` package to display battery, charger, fan, and all thermal sensors in the LuCI Status menu. Directory structure already created.
+3. **Backlight PWM** — Requires 7 PWMv4 patches (`341-01` through `341-07`) from the Photonicat mainline repo to add `pwm2_8ch_2` node to `rk3576.dtsi`. Currently using GPIO toggle (on/off) as workaround.
+4. **pcat-usb-wdt USB hub watchdog** — Optional: port the USB hub watchdog driver for extra stability (resets the GL3510 hub if it disappears).
+5. **Upstream submission** — Clean DTS, split commits, write cover letter, submit to OpenWrt mailing list / GitHub PR.
+
+---
+
+## Step 26 — Display Application (Complete ✅)
+
+**Date:** 2026-03-01
+
+Successfully built a custom C application (`pcat2-display`) that drives the PhotoniCAT 2's
+built-in GC9307 172×320 TFT LCD via SPI, displaying real-time system status information.
+
+### Hardware Details
+
+| Item | Detail |
+|------|--------|
+| Display IC | GC9307 (ST7789-compatible) |
+| Resolution | 172×320 pixels |
+| Color | RGB565, 16-bit (65K colors) |
+| Interface | SPI1.0 (`/dev/spidev1.0`), 6 MHz, Mode 0 |
+| DC pin | GPIO3_PD1 (bank 3, offset 25) — data/command select |
+| RST pin | GPIO3_PD2 (bank 3, offset 26) — hardware reset |
+| BL pin | GPIO3_C5 (bank 3, offset 21) — backlight, **active LOW** (inverted polarity) |
+| Rotation | 180° (MADCTL = MX = 0x40) |
+| Column offset | 34 (GC9307 172px panel within 240px controller RAM) |
+
+### Key Implementation Details
+
+**GPIO:** Uses Linux GPIO chardev v2 API (`GPIO_V2_GET_LINE_IOCTL`, `GPIO_V2_LINE_SET_VALUES_IOCTL`).
+Older v1 API (`GPIOHANDLE_GET_LINE_VALUES_IOCTL`) is explicitly disabled in OpenWrt's generic
+kernel config (`# CONFIG_GPIO_CDEV_V1 is not set`). GPIO sysfs is also disabled.
+
+**SPI:** Standard `spidev` ioctl interface with chunked transfers (4096 bytes per message) for the
+full 172×320×2 = 110,080-byte framebuffer. SPI chip-select is handled by the SPI controller
+hardware (no manual CS GPIO needed — factory Go driver also uses `UseCS: false`).
+
+**Init sequence:** `SWRESET → SLPOUT → COLMOD(0x55) → MADCTL(0x40) → INVOFF → NORON → DISPON → BL=LOW`.
+This matches the factory Go driver (`photonicat/periph.io-gc9307/st7789.go`), including:
+- `INVOFF` (not INVON — GC9307 default inversion state is correct)
+- Backlight active-LOW (PWM polarity is inverted per factory DTS: `pwm-polarity = <0x01>`)
+- Column offset 34 for ROTATION_180
+
+**Display content (refreshes every 5 seconds):**
+- System hostname
+- Current date and time
+- Battery percentage and charge status
+- WAN interface IP and status
+- WiFi SSID, frequency band, connected clients
+- System uptime, CPU load average, memory usage
+
+**Font:** Built-in 5×7 bitmap font (ASCII 0x20–0x7E), rendered with 2× scaling for readability
+on the small display.
+
+### Challenges Overcome
+
+1. **GPIO sysfs unavailable** — `CONFIG_GPIO_SYSFS` not enabled. Rewrote to chardev API.
+2. **GPIO chardev v1 unavailable** — `CONFIG_GPIO_CDEV_V1` explicitly disabled. Rewrote to v2 API.
+3. **Wrong backlight pin** — Initially used GPIO0_B4 (offset 12). Factory DTS analysis revealed
+   backlight is actually on GPIO3_C5 (offset 21) via the `pwm@2ade2000` node.
+4. **Inverted backlight polarity** — Factory DTS has `pwm-polarity = <0x01>` (inverted). Setting
+   GPIO HIGH turns backlight OFF. Setting LOW turns it ON.
+5. **INVON vs INVOFF** — Factory Go driver uses `INVOFF`, not `INVON`. Using `INVON` caused
+   incorrect display output.
+6. **No PWM driver** — `CONFIG_PWM` is disabled in OpenWrt's generic kernel config. The
+   `CONFIG_PWM_ROCKCHIP` enable in the rockchip config is overridden. Used GPIO on/off as
+   a workaround (full brightness only, no dimming).
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `package/pcat2-display/Makefile` | OpenWrt package definition |
+| `package/pcat2-display/src/pcat2-display.c` | Main application (~800 lines) |
+| `package/pcat2-display/src/Makefile` | Build rules |
+| `package/pcat2-display/files/pcat2-display.init` | procd init script (START=99) |
+
+### Service Status
+
+- **Running:** Process confirmed running on device (PID active)
+- **Boot service:** Enabled via procd (`/etc/init.d/pcat2-display enable`)
+- **Package:** `pcat2-display-1.0.0-r1.apk` installed on device
+- **Included in image:** Added to `DEVICE_PACKAGES` in `armv8.mk`
+---
+
+### 27. Cleanup & PR Preparation
+
+**Device health audit (all systems verified working):**
+- Display running (PID active, auto-start on boot)
+- WiFi 6GHz AP on channel 33 (80 MHz), WCN6855 via ath11k_pci
+- Cellular 5G connected (Quectel RM520N-GL, T-Mobile QMI)
+- Battery 97%, MCU communication healthy
+- Thermals normal (37–40°C)
+- DNS resolving, internet connectivity confirmed
+
+**Known non-issues:**
+- CMA alloc errors from ath11k (16 MiB CMA is a shared rockchip config — WiFi works fine despite warnings, not a board-specific fix)
+- QMI "Failed to connect to service" at boot (normal modem startup timing, resolves within seconds)
+- eth0 (WAN) NO-CARRIER (no cable plugged in, using cellular)
+
+**Cleanup performed:**
+1. Fixed DTS patch header: WCN7850 → WCN6855, added battery/display/fan to specs
+2. Removed stale LED references from progress notes (no front-panel LEDs; power button LED is MCU-controlled)
+3. Removed leftover `gpio-test.c` debug file from display package
+4. Reorganized git history from 2 messy commits into 3 clean, logically separated commits
+
+**Git commits (on `add-ariaboard-photonicat-2` branch, 3 commits on top of `origin/main`):**
+
+| Commit | Subject | Files |
+|--------|---------|-------|
+| `36d979f` | kernel: add staging driver for Photonicat power manager | 2 |
+| `25818cc` | rockchip: add support for Ariaboard Photonicat 2 | 12 |
+| `03ef564` | pcat2-display: add display status application for PhotoniCAT 2 | 4 |
+
+**Total:** 18 files changed, +4174 lines
+
+**Pushed to:** `th3cavalry/openwrt` branch `add-ariaboard-photonicat-2` (force-pushed clean history)
