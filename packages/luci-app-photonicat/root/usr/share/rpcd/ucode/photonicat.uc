@@ -4,7 +4,7 @@
 
 'use strict';
 
-import { readfile, writefile, glob, access } from 'fs';
+import { readfile, writefile, glob, access, popen } from 'fs';
 import { cursor } from 'uci';
 
 function find_hwmon(name) {
@@ -197,6 +197,92 @@ const methods = {
 			uci.set('photonicat', 'cpu', 'governor', governor);
 			uci.commit('photonicat');
 			uci.unload();
+
+			return { success: true };
+		}
+	},
+
+	get_display_config: {
+		call: function() {
+			let uci = cursor();
+			uci.load('photonicat');
+
+			let result = {
+				backlight:  +(uci.get('photonicat', 'display', 'backlight') || '1'),
+				refresh:    +(uci.get('photonicat', 'display', 'refresh') || '5'),
+				theme:      uci.get('photonicat', 'display', 'theme') || 'dark',
+				font_scale: +(uci.get('photonicat', 'display', 'font_scale') || '1'),
+				pages:      uci.get('photonicat', 'display', 'pages') || ['clock','battery','network','wifi','thermal','system']
+			};
+
+			// Custom parameters
+			let params = [];
+			for (let i = 0; i < 10; i++) {
+				let sect = 'display_param_' + i;
+				let label = uci.get('photonicat', sect, 'label');
+				if (!label) break;
+				push(params, {
+					label:  label,
+					source: uci.get('photonicat', sect, 'source') || '',
+					unit:   uci.get('photonicat', sect, 'unit') || '',
+					divide: +(uci.get('photonicat', sect, 'divide') || '0')
+				});
+			}
+			result.custom_params = params;
+
+			uci.unload();
+			return result;
+		}
+	},
+
+	set_display_config: {
+		args: { backlight: 0, refresh: 0, theme: '', font_scale: 0, pages: [] },
+		call: function(req) {
+			let a = req.args;
+
+			let valid_themes = ['dark', 'light', 'green', 'cyan', 'amber'];
+			if (a.theme && index(valid_themes, a.theme) < 0)
+				return { error: 'Invalid theme' };
+
+			let valid_pages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+
+			let uci = cursor();
+			uci.load('photonicat');
+
+			// Ensure display section exists
+			if (!uci.get('photonicat', 'display')) {
+				uci.set('photonicat', 'display', 'display');
+			}
+
+			if (a.backlight != null)
+				uci.set('photonicat', 'display', 'backlight', '' + (a.backlight ? 1 : 0));
+
+			if (a.refresh != null && a.refresh >= 1 && a.refresh <= 60)
+				uci.set('photonicat', 'display', 'refresh', '' + a.refresh);
+
+			if (a.theme)
+				uci.set('photonicat', 'display', 'theme', a.theme);
+
+			if (a.font_scale != null && a.font_scale >= 1 && a.font_scale <= 3)
+				uci.set('photonicat', 'display', 'font_scale', '' + a.font_scale);
+
+			if (a.pages && length(a.pages) > 0) {
+				// Validate pages
+				let filtered = [];
+				for (let p in a.pages) {
+					if (index(valid_pages, p) >= 0)
+						push(filtered, p);
+				}
+				if (length(filtered) > 0)
+					uci.set('photonicat', 'display', 'pages', filtered);
+			}
+
+			uci.commit('photonicat');
+			uci.unload();
+
+			// Signal display daemon to reload config
+			let ph = popen('killall -HUP pcat2-display 2>/dev/null');
+			if (ph) ph.close();
 
 			return { success: true };
 		}

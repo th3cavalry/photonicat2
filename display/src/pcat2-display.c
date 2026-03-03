@@ -1,12 +1,15 @@
 /*
  * pcat2-display - PhotoniCAT 2 Mini Display Status Application
  *
- * Drives the GC9307 172x320 TFT LCD via SPI to show system status:
- * time/date, battery, WAN, WiFi, and system information.
+ * Drives the GC9307 172x320 TFT LCD via SPI to show system status.
+ * All configuration is read from UCI (/etc/config/photonicat).
  *
  * Hardware: GC9307 on SPI1.0 (6MHz), DC=GPIO3_PD1, RST=GPIO3_PD2, BL=GPIO3_C5
  * Display: 172x320 pixels, RGB565 color, rotation 180 deg, column offset 34
  * Backlight: active LOW (PWM polarity inverted per factory DTS)
+ *
+ * Configurable: pages, theme, refresh rate, backlight, custom params.
+ * SIGHUP reloads config.  SIGTERM/SIGINT cleanly shutdown.
  *
  * Copyright (C) 2026 - GPLv3
  */
@@ -25,26 +28,24 @@
 #include <linux/spi/spidev.h>
 #include <linux/gpio.h>
 
-/* ------------------------------------------------------------------ */
-/*  Configuration                                                      */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  Hardware constants                                                 */
+/* ================================================================== */
 
 #define SPI_DEVICE      "/dev/spidev1.0"
-#define SPI_SPEED_HZ    6000000     /* 6 MHz */
-#define SPI_CHUNK       4096        /* bytes per SPI transfer */
+#define SPI_SPEED_HZ    6000000
+#define SPI_CHUNK       4096
 
 #define DISP_W          172
 #define DISP_H          320
-#define COL_OFFSET      34          /* GC9307 column offset for 172px panel */
+#define COL_OFFSET      34
 
-/* GPIO chardev: /dev/gpiochipN where N = bank, offset within bank.
- * RK3576: gpio0..gpio4 map to /dev/gpiochip0../dev/gpiochip4. */
 #define DC_BANK     3
-#define DC_OFFSET   25              /* GPIO3_PD1 */
+#define DC_OFFSET   25
 #define RST_BANK    3
-#define RST_OFFSET  26              /* GPIO3_PD2 */
+#define RST_OFFSET  26
 #define BL_BANK     3
-#define BL_OFFSET   21              /* GPIO3_C5 – PWM backlight pin */
+#define BL_OFFSET   21
 
 /* GC9307 / ST7789 registers */
 #define CMD_SWRESET 0x01
@@ -52,8 +53,6 @@
 #define CMD_SLPIN   0x10
 #define CMD_NORON   0x13
 #define CMD_INVOFF  0x20
-#define CMD_INVON   0x21
-#define CMD_DISPOFF 0x28
 #define CMD_DISPON  0x29
 #define CMD_CASET   0x2A
 #define CMD_RASET   0x2B
@@ -62,33 +61,231 @@
 #define CMD_MADCTL  0x36
 #define MADCTL_MX   0x40
 
-/* BGR565 colour helpers – display byte order is big-endian */
+/* BGR565 colour helpers - display byte order is big-endian */
 #define RGB565(r,g,b) ( (uint16_t)( \
         (((uint16_t)((b)>>3))<<11) | \
         (((uint16_t)((g)>>2))<<5)  | \
          ((uint16_t)((r)>>3)) ))
 
-/* pre-computed colours (host-endian, swapped on write) */
-#define COL_BLACK   RGB565(0,0,0)
-#define COL_WHITE   RGB565(255,255,255)
-#define COL_RED     RGB565(255,40,40)
-#define COL_GREEN   RGB565(40,255,40)
-#define COL_CYAN    RGB565(0,220,220)
-#define COL_YELLOW  RGB565(255,255,0)
-#define COL_ORANGE  RGB565(255,165,0)
-#define COL_GRAY    RGB565(100,100,100)
-#define COL_DKGRAY  RGB565(40,40,40)
-#define COL_NAVY    RGB565(0,8,30)
+/* ================================================================== */
+/*  Theme colours (set at runtime from config)                         */
+/* ================================================================== */
 
-#define UPDATE_SEC  5               /* seconds between refreshes */
+static uint16_t COL_BG;         /* background */
+static uint16_t COL_FG;         /* primary text */
+static uint16_t COL_ACCENT;     /* section headers, highlights */
+static uint16_t COL_DIM;        /* separators, secondary text */
+static uint16_t COL_TOPBAR;     /* top bar background */
+static uint16_t COL_GOOD;       /* green: OK indicators */
+static uint16_t COL_WARN;       /* yellow/orange: warnings */
+static uint16_t COL_BAD;        /* red: errors */
 
-/* ------------------------------------------------------------------ */
-/*  Adafruit GFX 5x7 bitmap font (column-major, LSB = top row)        */
-/*  Covers ASCII 0x20 (' ') through 0x7E ('~')  –  95 characters      */
-/* ------------------------------------------------------------------ */
+/* preset themes */
+struct theme {
+    const char *name;
+    uint16_t bg, fg, accent, dim, topbar, good, warn, bad;
+};
+
+static const struct theme themes[] = {
+    {"dark",
+        RGB565(0,0,0),       RGB565(255,255,255), RGB565(0,220,220),
+        RGB565(40,40,40),    RGB565(0,8,30),      RGB565(40,255,40),
+        RGB565(255,200,0),   RGB565(255,40,40)},
+    {"light",
+        RGB565(240,240,235), RGB565(20,20,20),    RGB565(0,100,180),
+        RGB565(180,180,170), RGB565(200,200,195), RGB565(0,130,0),
+        RGB565(200,150,0),   RGB565(200,0,0)},
+    {"green",
+        RGB565(0,0,0),       RGB565(0,255,0),     RGB565(0,200,0),
+        RGB565(0,60,0),      RGB565(0,15,0),      RGB565(0,255,0),
+        RGB565(255,255,0),   RGB565(255,40,40)},
+    {"cyan",
+        RGB565(0,0,0),       RGB565(0,230,230),   RGB565(0,180,255),
+        RGB565(0,40,50),     RGB565(0,10,20),     RGB565(0,255,128),
+        RGB565(255,200,0),   RGB565(255,40,40)},
+    {"amber",
+        RGB565(0,0,0),       RGB565(255,180,0),   RGB565(255,140,0),
+        RGB565(50,30,0),     RGB565(20,10,0),     RGB565(0,255,0),
+        RGB565(255,255,0),   RGB565(255,40,40)},
+    {NULL, 0,0,0,0,0,0,0,0}
+};
+
+static void apply_theme(const char *name)
+{
+    for (int i = 0; themes[i].name; i++) {
+        if (strcmp(themes[i].name, name) == 0) {
+            COL_BG     = themes[i].bg;
+            COL_FG     = themes[i].fg;
+            COL_ACCENT = themes[i].accent;
+            COL_DIM    = themes[i].dim;
+            COL_TOPBAR = themes[i].topbar;
+            COL_GOOD   = themes[i].good;
+            COL_WARN   = themes[i].warn;
+            COL_BAD    = themes[i].bad;
+            return;
+        }
+    }
+    /* default to dark */
+    apply_theme("dark");
+}
+
+/* ================================================================== */
+/*  Configuration                                                      */
+/* ================================================================== */
+
+#define MAX_PAGES    8
+#define MAX_CUSTOM  10
+
+struct custom_param {
+    char label[32];
+    char source[256];       /* sysfs path or 'cmd:shell command' */
+    char unit[16];
+    int  divide;            /* divide integer result by this (e.g. 1000 for mV->V) */
+};
+
+struct config {
+    int  backlight;                 /* 0=off, 1=on */
+    int  refresh;                   /* seconds */
+    char theme[16];
+    int  font_scale;                /* 1 or 2 */
+
+    /* pages to show, in order */
+    int  num_pages;
+    char pages[MAX_PAGES][16];      /* "clock", "battery", "network", "wifi", "thermal", "system", "custom" */
+
+    /* custom parameters */
+    int  num_custom;
+    struct custom_param custom[MAX_CUSTOM];
+};
+
+static struct config cfg;
+
+/* Simple UCI parser - reads /etc/config/photonicat */
+static void config_defaults(void)
+{
+    cfg.backlight  = 1;
+    cfg.refresh    = 5;
+    strncpy(cfg.theme, "dark", sizeof(cfg.theme));
+    cfg.font_scale = 1;
+
+    /* default pages */
+    cfg.num_pages = 6;
+    strncpy(cfg.pages[0], "clock", sizeof(cfg.pages[0]));
+    strncpy(cfg.pages[1], "battery", sizeof(cfg.pages[1]));
+    strncpy(cfg.pages[2], "network", sizeof(cfg.pages[2]));
+    strncpy(cfg.pages[3], "wifi", sizeof(cfg.pages[3]));
+    strncpy(cfg.pages[4], "thermal", sizeof(cfg.pages[4]));
+    strncpy(cfg.pages[5], "system", sizeof(cfg.pages[5]));
+
+    cfg.num_custom = 0;
+}
+
+/* Read UCI option using 'uci -q get' */
+static int uci_get(const char *key, char *buf, size_t len)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "uci -q get photonicat.%s 2>/dev/null", key);
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
+    buf[0] = '\0';
+    if (fgets(buf, len, f) == NULL) buf[0] = '\0';
+    pclose(f);
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    return buf[0] ? 0 : -1;
+}
+
+/* Read UCI list option */
+static int uci_get_list(const char *section, const char *option,
+                        char list[][16], int max_items)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "uci -q get photonicat.%s.%s 2>/dev/null", section, option);
+    FILE *f = popen(cmd, "r");
+    if (!f) return 0;
+
+    int count = 0;
+    char line[256];
+    if (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        /* UCI lists are space-separated when read with 'get' */
+        char *tok = strtok(line, " ");
+        while (tok && count < max_items) {
+            strncpy(list[count], tok, 15);
+            list[count][15] = '\0';
+            count++;
+            tok = strtok(NULL, " ");
+        }
+    }
+    pclose(f);
+    return count;
+}
+
+static void config_load(void)
+{
+    char buf[256];
+
+    config_defaults();
+
+    if (uci_get("display.backlight", buf, sizeof(buf)) == 0)
+        cfg.backlight = atoi(buf);
+
+    if (uci_get("display.refresh", buf, sizeof(buf)) == 0) {
+        cfg.refresh = atoi(buf);
+        if (cfg.refresh < 1) cfg.refresh = 1;
+        if (cfg.refresh > 60) cfg.refresh = 60;
+    }
+
+    if (uci_get("display.theme", buf, sizeof(buf)) == 0)
+        strncpy(cfg.theme, buf, sizeof(cfg.theme) - 1);
+
+    if (uci_get("display.font_scale", buf, sizeof(buf)) == 0) {
+        cfg.font_scale = atoi(buf);
+        if (cfg.font_scale < 1) cfg.font_scale = 1;
+        if (cfg.font_scale > 3) cfg.font_scale = 3;
+    }
+
+    /* pages list */
+    int n = uci_get_list("display", "pages", cfg.pages, MAX_PAGES);
+    if (n > 0) cfg.num_pages = n;
+
+    /* custom parameters: display_param sections */
+    cfg.num_custom = 0;
+    for (int i = 0; i < MAX_CUSTOM; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "display_param_%d.label", i);
+        if (uci_get(key, buf, sizeof(buf)) != 0) break;
+        strncpy(cfg.custom[cfg.num_custom].label, buf, 31);
+
+        snprintf(key, sizeof(key), "display_param_%d.source", i);
+        if (uci_get(key, buf, sizeof(buf)) == 0)
+            strncpy(cfg.custom[cfg.num_custom].source, buf, 255);
+
+        snprintf(key, sizeof(key), "display_param_%d.unit", i);
+        if (uci_get(key, buf, sizeof(buf)) == 0)
+            strncpy(cfg.custom[cfg.num_custom].unit, buf, 15);
+
+        snprintf(key, sizeof(key), "display_param_%d.divide", i);
+        if (uci_get(key, buf, sizeof(buf)) == 0)
+            cfg.custom[cfg.num_custom].divide = atoi(buf);
+        else
+            cfg.custom[cfg.num_custom].divide = 0;
+
+        cfg.num_custom++;
+    }
+
+    apply_theme(cfg.theme);
+}
+
+/* ================================================================== */
+/*  5x7 font bitmap (column-major, LSB = top row) ASCII 0x20..0x7E    */
+/* ================================================================== */
 
 static const unsigned char font5x7[95][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, /* 0x20 space */
+    {0x00,0x00,0x00,0x00,0x00}, /* space */
     {0x00,0x00,0x5F,0x00,0x00}, /* ! */
     {0x00,0x07,0x00,0x07,0x00}, /* " */
     {0x14,0x7F,0x14,0x7F,0x14}, /* # */
@@ -185,24 +382,22 @@ static const unsigned char font5x7[95][5] = {
     {0x10,0x08,0x08,0x10,0x08}, /* ~ */
 };
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /*  Global state                                                       */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
-static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t running    = 1;
+static volatile sig_atomic_t reload_cfg = 0;
 static int spi_fd = -1;
-
-/* GPIO chardev line handles (fd from GPIO_GET_LINEHANDLE_IOCTL) */
 static int dc_line_fd  = -1;
 static int rst_line_fd = -1;
 static int bl_line_fd  = -1;
 
-/* framebuffer in display byte order (big-endian RGB565) */
 static uint8_t fb[DISP_W * DISP_H * 2];
 
-/* ------------------------------------------------------------------ */
-/*  Utility: read a sysfs file into a buffer                           */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  Utility                                                            */
+/* ================================================================== */
 
 static int read_sysfs(const char *path, char *buf, size_t len)
 {
@@ -224,23 +419,26 @@ static int read_sysfs_int(const char *path)
     return atoi(buf);
 }
 
-/* ------------------------------------------------------------------ */
-/*  GPIO (chardev v2 API – CONFIG_GPIO_CDEV without V1 compat)         */
-/* ------------------------------------------------------------------ */
+static void run_cmd(const char *cmd, char *buf, size_t len)
+{
+    buf[0] = '\0';
+    FILE *f = popen(cmd, "r");
+    if (!f) return;
+    if (fgets(buf, len, f) == NULL) buf[0] = '\0';
+    pclose(f);
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+}
 
-/*
- * Request an output GPIO line on the given bank + offset using the
- * v2 chardev API (GPIO_V2_GET_LINE_IOCTL).  The v1 API is disabled
- * in OpenWrt's generic kernel config (CONFIG_GPIO_CDEV_V1 is not set).
- *
- * Returns the line request fd (>= 0) on success, -1 on failure.
- */
+/* ================================================================== */
+/*  GPIO (chardev v2 API)                                              */
+/* ================================================================== */
+
 static int gpio_request_output(int bank, int offset,
                                const char *name, int initial)
 {
     char path[64];
     snprintf(path, sizeof(path), "/dev/gpiochip%d", bank);
-
     int chip_fd = open(path, O_RDWR);
     if (chip_fd < 0) {
         fprintf(stderr, "gpio: cannot open %s: %s\n", path, strerror(errno));
@@ -249,17 +447,15 @@ static int gpio_request_output(int bank, int offset,
 
     struct gpio_v2_line_request req;
     memset(&req, 0, sizeof(req));
-    req.offsets[0]  = offset;
-    req.num_lines   = 1;
+    req.offsets[0] = offset;
+    req.num_lines  = 1;
     strncpy(req.consumer, name, sizeof(req.consumer) - 1);
-
     req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
     if (initial) {
-        /* set the default output value via a single-attribute */
         req.config.num_attrs = 1;
-        req.config.attrs[0].attr.id = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
-        req.config.attrs[0].attr.values = 1;   /* bit 0 = line 0 value */
-        req.config.attrs[0].mask = 1;           /* applies to line 0 */
+        req.config.attrs[0].attr.id     = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
+        req.config.attrs[0].attr.values = 1;
+        req.config.attrs[0].mask        = 1;
     }
 
     if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
@@ -268,8 +464,7 @@ static int gpio_request_output(int bank, int offset,
         close(chip_fd);
         return -1;
     }
-
-    close(chip_fd);     /* chip fd can be closed; line request fd stays valid */
+    close(chip_fd);
     return req.fd;
 }
 
@@ -278,24 +473,21 @@ static void gpio_set(int line_fd, int value)
     if (line_fd < 0) return;
     struct gpio_v2_line_values vals;
     memset(&vals, 0, sizeof(vals));
-    vals.mask = 1;                  /* bit 0 = line 0 */
+    vals.mask = 1;
     vals.bits = value ? 1 : 0;
     ioctl(line_fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals);
 }
 
-/* ------------------------------------------------------------------ */
-/*  SPI helpers                                                        */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  SPI                                                                */
+/* ================================================================== */
 
 static int spi_init(void)
 {
     spi_fd = open(SPI_DEVICE, O_RDWR);
     if (spi_fd < 0) { perror(SPI_DEVICE); return -1; }
-
-    uint8_t  mode = SPI_MODE_0;
-    uint8_t  bits = 8;
+    uint8_t  mode = SPI_MODE_0, bits = 8;
     uint32_t speed = SPI_SPEED_HZ;
-
     ioctl(spi_fd, SPI_IOC_WR_MODE, &mode);
     ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
     ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
@@ -319,19 +511,19 @@ static void spi_write(const uint8_t *data, size_t len)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  GC9307 display commands                                            */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  GC9307 display                                                     */
+/* ================================================================== */
 
 static void disp_cmd(uint8_t cmd)
 {
-    gpio_set(dc_line_fd, 0);             /* command mode */
+    gpio_set(dc_line_fd, 0);
     spi_write(&cmd, 1);
 }
 
 static void disp_data(const uint8_t *data, size_t len)
 {
-    gpio_set(dc_line_fd, 1);             /* data mode */
+    gpio_set(dc_line_fd, 1);
     spi_write(data, len);
 }
 
@@ -343,50 +535,38 @@ static void disp_data1(uint8_t val)
 static void disp_set_window(int x, int y, int w, int h)
 {
     uint16_t xs = x + COL_OFFSET, xe = x + w - 1 + COL_OFFSET;
-    uint16_t ys = y,              ye = y + h - 1;
-
+    uint16_t ys = y, ye = y + h - 1;
     uint8_t ca[4] = { xs >> 8, xs & 0xFF, xe >> 8, xe & 0xFF };
     uint8_t ra[4] = { ys >> 8, ys & 0xFF, ye >> 8, ye & 0xFF };
-
     disp_cmd(CMD_CASET); disp_data(ca, 4);
     disp_cmd(CMD_RASET); disp_data(ra, 4);
 }
 
 static void disp_init(void)
 {
-    /* HW reset */
     gpio_set(rst_line_fd, 1); usleep(10000);
     gpio_set(rst_line_fd, 0); usleep(50000);
     gpio_set(rst_line_fd, 1); usleep(10000);
-
     disp_cmd(CMD_SWRESET); usleep(150000);
     disp_cmd(CMD_SLPOUT);  usleep(150000);
-
-    /* 16-bit colour */
-    disp_cmd(CMD_COLMOD); disp_data1(0x55); usleep(10000);
-
-    /* rotation 180: MADCTL = MX (0x40) */
-    disp_cmd(CMD_MADCTL); disp_data1(MADCTL_MX);
-
-    /* display on – GC9307 uses INVOFF per factory driver */
-    disp_cmd(CMD_INVOFF); usleep(10000);
-    disp_cmd(CMD_NORON);  usleep(10000);
-    disp_cmd(CMD_DISPON); usleep(10000);
-
-    /* backlight on – active LOW (PWM polarity is inverted per factory DTS) */
-    gpio_set(bl_line_fd, 0);
+    disp_cmd(CMD_COLMOD);  disp_data1(0x55); usleep(10000);
+    disp_cmd(CMD_MADCTL);  disp_data1(MADCTL_MX);
+    disp_cmd(CMD_INVOFF);  usleep(10000);
+    disp_cmd(CMD_NORON);   usleep(10000);
+    disp_cmd(CMD_DISPON);  usleep(10000);
+    gpio_set(bl_line_fd, 0);  /* backlight on (active LOW) */
 }
 
 static void disp_sleep(void)
 {
-    gpio_set(bl_line_fd, 1);   /* backlight off (active LOW, so HIGH = off) */
-    disp_cmd(CMD_DISPOFF); usleep(10000);
-    disp_cmd(CMD_SLPIN);   usleep(10000);
+    gpio_set(bl_line_fd, 1);
+    disp_cmd(0x28); usleep(10000);  /* DISPOFF */
+    disp_cmd(CMD_SLPIN); usleep(10000);
 }
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /*  Framebuffer primitives                                             */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 static void fb_clear(uint16_t col)
 {
@@ -414,25 +594,25 @@ static void fb_rect(int x, int y, int w, int h, uint16_t col)
 
 static void fb_hline(int x, int y, int w, uint16_t col)
 {
-    for (int dx = 0; dx < w; dx++)
-        fb_pixel(x + dx, y, col);
+    for (int dx = 0; dx < w; dx++) fb_pixel(x + dx, y, col);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Text rendering (5x7 font, scale 1x or 2x)                         */
-/* ------------------------------------------------------------------ */
+static void fb_flush(void)
+{
+    disp_set_window(0, 0, DISP_W, DISP_H);
+    disp_cmd(CMD_RAMWR);
+    gpio_set(dc_line_fd, 1);
+    spi_write(fb, sizeof(fb));
+}
 
-/*
- * Draw one character.  The font is column-major: each byte is a
- * vertical column of 7 pixels (LSB = top).  We render the 5 data
- * columns plus 1 trailing blank column, and 7 data rows plus
- * 1 trailing blank row, all scaled by `s`.
- */
+/* ================================================================== */
+/*  Text rendering                                                     */
+/* ================================================================== */
+
 static void draw_char(int x, int y, char ch, uint16_t fg, uint16_t bg, int s)
 {
     if (ch < 0x20 || ch > 0x7E) ch = '?';
     const unsigned char *glyph = font5x7[ch - 0x20];
-
     for (int col = 0; col < 6; col++) {
         uint8_t bits = (col < 5) ? glyph[col] : 0;
         for (int row = 0; row < 8; row++) {
@@ -444,7 +624,6 @@ static void draw_char(int x, int y, char ch, uint16_t fg, uint16_t bg, int s)
     }
 }
 
-/* returns the X coordinate after the last character */
 static int draw_str(int x, int y, const char *str,
                     uint16_t fg, uint16_t bg, int s)
 {
@@ -456,7 +635,6 @@ static int draw_str(int x, int y, const char *str,
     return x;
 }
 
-/* draw string right-aligned at xr (right edge) */
 static void draw_str_r(int xr, int y, const char *str,
                        uint16_t fg, uint16_t bg, int s)
 {
@@ -464,7 +642,6 @@ static void draw_str_r(int xr, int y, const char *str,
     draw_str(xr - len * 6 * s, y, str, fg, bg, s);
 }
 
-/* draw string centred */
 static void draw_str_c(int y, const char *str,
                        uint16_t fg, uint16_t bg, int s)
 {
@@ -472,26 +649,12 @@ static void draw_str_c(int y, const char *str,
     draw_str((DISP_W - w) / 2, y, str, fg, bg, s);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Push framebuffer to display                                        */
-/* ------------------------------------------------------------------ */
-
-static void fb_flush(void)
-{
-    disp_set_window(0, 0, DISP_W, DISP_H);
-    disp_cmd(CMD_RAMWR);
-    gpio_set(dc_line_fd, 1);           /* data mode for pixel stream */
-    spi_write(fb, sizeof(fb));
-}
-
-/* ------------------------------------------------------------------ */
-/*  System data collection helpers                                     */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  Data collection helpers                                            */
+/* ================================================================== */
 
 static int get_battery_pct(void)
-{
-    return read_sysfs_int("/sys/class/power_supply/battery/capacity");
-}
+{ return read_sysfs_int("/sys/class/power_supply/battery/capacity"); }
 
 static void get_battery_status(char *buf, size_t len)
 {
@@ -513,7 +676,6 @@ static int get_battery_current_ma(void)
 
 static int get_cpu_temp(void)
 {
-    /* try several thermal zones */
     static const char *paths[] = {
         "/sys/class/thermal/thermal_zone1/temp",
         "/sys/class/thermal/thermal_zone0/temp",
@@ -547,41 +709,23 @@ static void get_memory(int *used_mb, int *total_mb)
     long total = 0, avail = 0;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "MemTotal:", 9) == 0)
-            sscanf(line + 9, " %ld", &total);
-        else if (strncmp(line, "MemAvailable:", 13) == 0)
-            sscanf(line + 13, " %ld", &avail);
+        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, " %ld", &total);
+        else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, " %ld", &avail);
     }
     fclose(f);
     *total_mb = (int)(total / 1024);
     *used_mb  = (int)((total - avail) / 1024);
 }
 
-/* run a shell command, capture first line of output */
-static void run_cmd(const char *cmd, char *buf, size_t len)
-{
-    buf[0] = '\0';
-    FILE *f = popen(cmd, "r");
-    if (!f) return;
-    if (fgets(buf, len, f) == NULL) buf[0] = '\0';
-    pclose(f);
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
-}
-
 static void get_wan_info(char *iface, size_t ilen, char *ip, size_t iplen)
 {
     strncpy(iface, "", ilen);
     strncpy(ip, "N/A", iplen);
-
-    /* find default route interface */
     char line[256];
     run_cmd("ip route show default 2>/dev/null | head -1", line, sizeof(line));
     char *dev = strstr(line, "dev ");
     if (dev) sscanf(dev + 4, "%s", iface);
-
     if (iface[0] == '\0') return;
-
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
         "ip -4 addr show %s 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1",
@@ -600,11 +744,8 @@ static void get_wifi_band_chan(char *buf, size_t len)
     char band[16] = "", chan[16] = "";
     run_cmd("uci -q get wireless.radio0.band 2>/dev/null", band, sizeof(band));
     run_cmd("uci -q get wireless.radio0.channel 2>/dev/null", chan, sizeof(chan));
-
-    if (band[0] && chan[0])
-        snprintf(buf, len, "%s Ch%s", band, chan);
-    else
-        strncpy(buf, "N/A", len);
+    if (band[0] && chan[0]) snprintf(buf, len, "%s Ch%s", band, chan);
+    else strncpy(buf, "N/A", len);
 }
 
 static int get_wifi_clients(void)
@@ -614,74 +755,144 @@ static int get_wifi_clients(void)
     return atoi(buf);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Render the status screen                                           */
-/* ------------------------------------------------------------------ */
-
-static void render_screen(void)
+static int get_fan_rpm(void)
 {
-    char tmp[128];
-    int y;
+    /* find hwmon with name pcat_pm_hwmon_speed_fan */
+    for (int i = 0; i < 20; i++) {
+        char path[64], name[64];
+        snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/name", i);
+        if (read_sysfs(path, name, sizeof(name)) < 0) continue;
+        if (strcmp(name, "pcat_pm_hwmon_speed_fan") == 0) {
+            snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/fan1_input", i);
+            return read_sysfs_int(path);
+        }
+    }
+    return -1;
+}
 
-    fb_clear(COL_BLACK);
+static int get_fan_level(void)
+{
+    for (int i = 0; i < 10; i++) {
+        char path[64], type[32];
+        snprintf(path, sizeof(path), "/sys/class/thermal/cooling_device%d/type", i);
+        if (read_sysfs(path, type, sizeof(type)) < 0) continue;
+        if (strcmp(type, "pcat-pm-fan") == 0) {
+            snprintf(path, sizeof(path), "/sys/class/thermal/cooling_device%d/cur_state", i);
+            return read_sysfs_int(path);
+        }
+    }
+    return -1;
+}
 
-    /* === TOP BAR (dark navy, y 0..23) === */
-    fb_rect(0, 0, DISP_W, 24, COL_NAVY);
+static int get_board_temp(void)
+{
+    for (int i = 0; i < 20; i++) {
+        char path[64], name[64];
+        snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/name", i);
+        if (read_sysfs(path, name, sizeof(name)) < 0) continue;
+        if (strcmp(name, "pcat_pm_hwmon_temp_mb") == 0) {
+            snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/temp1_input", i);
+            int t = read_sysfs_int(path);
+            return (t > 0) ? t / 1000 : -1;
+        }
+    }
+    return -1;
+}
 
+/* ================================================================== */
+/*  Section heading helper                                             */
+/* ================================================================== */
+
+static int section_header(int y, const char *title)
+{
+    int s = cfg.font_scale;
+    draw_str(4, y, title, COL_ACCENT, COL_BG, s);
+    fb_hline(4, y + 7 * s + 2, DISP_W - 8, COL_DIM);
+    return y + 8 * s + 4;
+}
+
+/* pick colour by temperature */
+static uint16_t temp_color(int t)
+{
+    if (t < 45) return COL_GOOD;
+    if (t < 65) return COL_FG;
+    if (t < 80) return COL_WARN;
+    return COL_BAD;
+}
+
+/* ================================================================== */
+/*  Renderable pages                                                   */
+/* ================================================================== */
+
+/* Returns: next Y position after drawing */
+
+static int render_clock(int y)
+{
+    char tmp[64];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
+    int s = cfg.font_scale;
+
+    /* time in large font */
     snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
-    draw_str(6, 4, tmp, COL_WHITE, COL_NAVY, 2);
+    draw_str_c(y, tmp, COL_FG, COL_BG, 2 * s);
+    y += 16 * s + 2;
 
-    int bpct = get_battery_pct();
-    if (bpct >= 0) {
-        snprintf(tmp, sizeof(tmp), "%d%%", bpct);
-        uint16_t bcol = (bpct > 20) ? COL_GREEN : (bpct > 10 ? COL_YELLOW : COL_RED);
-        draw_str_r(DISP_W - 6, 4, tmp, bcol, COL_NAVY, 2);
-    }
-
-    /* separator */
-    fb_hline(0, 24, DISP_W, COL_CYAN);
-    fb_hline(0, 25, DISP_W, COL_CYAN);
-
-    /* === DATE === */
+    /* date */
     static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     static const char *mon[]  = {"Jan","Feb","Mar","Apr","May","Jun",
                                  "Jul","Aug","Sep","Oct","Nov","Dec"};
     snprintf(tmp, sizeof(tmp), "%s %s %02d, %d",
              wday[t->tm_wday], mon[t->tm_mon], t->tm_mday, t->tm_year + 1900);
-    draw_str_c(30, tmp, COL_WHITE, COL_BLACK, 1);
+    draw_str_c(y, tmp, COL_DIM, COL_BG, s);
+    y += 8 * s + 4;
 
-    /* === BATTERY section === */
-    y = 46;
-    draw_str(4, y, "BATTERY", COL_CYAN, COL_BLACK, 1);
-    fb_hline(4, y + 9, DISP_W - 8, COL_DKGRAY);
-    y += 14;
+    return y;
+}
+
+static int render_battery(int y)
+{
+    char tmp[64];
+    int s = cfg.font_scale;
+
+    y = section_header(y, "BATTERY");
 
     char status[32];
     get_battery_status(status, sizeof(status));
-    uint16_t scol = COL_WHITE;
-    if (strstr(status, "Charging"))     scol = COL_GREEN;
-    else if (strstr(status, "Full"))    scol = COL_GREEN;
-    else if (strstr(status, "Not"))     scol = COL_ORANGE;
-    draw_str(8, y, status, scol, COL_BLACK, 1);
-    y += 10;
+    uint16_t scol = COL_FG;
+    if (strstr(status, "Charging") || strstr(status, "Full")) scol = COL_GOOD;
+    else if (strstr(status, "Not")) scol = COL_WARN;
+
+    int bpct = get_battery_pct();
+    if (bpct >= 0) {
+        snprintf(tmp, sizeof(tmp), "%s %d%%", status, bpct);
+        uint16_t pcol = (bpct > 20) ? scol : ((bpct > 10) ? COL_WARN : COL_BAD);
+        draw_str(8, y, tmp, pcol, COL_BG, s);
+    } else {
+        draw_str(8, y, status, scol, COL_BG, s);
+    }
+    y += 8 * s + 2;
 
     int mv = get_battery_voltage_mv();
     int ma = get_battery_current_ma();
     if (mv > 0 && ma >= 0)
-        snprintf(tmp, sizeof(tmp), "%d.%02dV  %dmA", mv / 1000, (mv % 1000) / 10, ma);
+        snprintf(tmp, sizeof(tmp), "%d.%02dV  %dmA", mv/1000, (mv%1000)/10, ma);
     else if (mv > 0)
-        snprintf(tmp, sizeof(tmp), "%d.%02dV", mv / 1000, (mv % 1000) / 10);
+        snprintf(tmp, sizeof(tmp), "%d.%02dV", mv/1000, (mv%1000)/10);
     else
         strncpy(tmp, "N/A", sizeof(tmp));
-    draw_str(8, y, tmp, COL_WHITE, COL_BLACK, 1);
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 4;
 
-    /* === NETWORK section === */
-    y += 18;
-    draw_str(4, y, "NETWORK", COL_CYAN, COL_BLACK, 1);
-    fb_hline(4, y + 9, DISP_W - 8, COL_DKGRAY);
-    y += 14;
+    return y;
+}
+
+static int render_network(int y)
+{
+    char tmp[128];
+    int s = cfg.font_scale;
+
+    y = section_header(y, "NETWORK");
 
     char wan_if[32] = "", wan_ip[64] = "N/A";
     get_wan_info(wan_if, sizeof(wan_if), wan_ip, sizeof(wan_ip));
@@ -689,78 +900,264 @@ static void render_screen(void)
         char opstate[16] = "?";
         snprintf(tmp, sizeof(tmp), "/sys/class/net/%s/operstate", wan_if);
         read_sysfs(tmp, opstate, sizeof(opstate));
-
         int is_up = (strcmp(opstate, "up") == 0 || strcmp(opstate, "unknown") == 0);
         snprintf(tmp, sizeof(tmp), "%s %s", wan_if, is_up ? "UP" : "DOWN");
-        draw_str(8, y, tmp, is_up ? COL_GREEN : COL_RED, COL_BLACK, 1);
+        draw_str(8, y, tmp, is_up ? COL_GOOD : COL_BAD, COL_BG, s);
     } else {
-        draw_str(8, y, "No default route", COL_RED, COL_BLACK, 1);
+        draw_str(8, y, "No default route", COL_BAD, COL_BG, s);
     }
-    y += 10;
+    y += 8 * s + 2;
 
     snprintf(tmp, sizeof(tmp), "IP: %s", wan_ip);
-    draw_str(8, y, tmp, COL_WHITE, COL_BLACK, 1);
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 4;
 
-    /* === WIFI section === */
-    y += 18;
-    draw_str(4, y, "WIFI", COL_CYAN, COL_BLACK, 1);
-    fb_hline(4, y + 9, DISP_W - 8, COL_DKGRAY);
-    y += 14;
+    return y;
+}
+
+static int render_wifi(int y)
+{
+    char tmp[128];
+    int s = cfg.font_scale;
+
+    y = section_header(y, "WIFI");
 
     char ssid[64];
     get_wifi_ssid(ssid, sizeof(ssid));
-    draw_str(8, y, ssid, COL_WHITE, COL_BLACK, 1);
-    y += 10;
+    draw_str(8, y, ssid, COL_FG, COL_BG, s);
+    y += 8 * s + 2;
 
     char bandchan[32];
     get_wifi_band_chan(bandchan, sizeof(bandchan));
     int clients = get_wifi_clients();
     snprintf(tmp, sizeof(tmp), "%s  %dSTA", bandchan, clients);
-    draw_str(8, y, tmp, COL_WHITE, COL_BLACK, 1);
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 4;
 
-    /* === SYSTEM section === */
-    y += 18;
-    draw_str(4, y, "SYSTEM", COL_CYAN, COL_BLACK, 1);
-    fb_hline(4, y + 9, DISP_W - 8, COL_DKGRAY);
-    y += 14;
+    return y;
+}
+
+static int render_thermal(int y)
+{
+    char tmp[64];
+    int s = cfg.font_scale;
+
+    y = section_header(y, "THERMAL");
+
+    /* Fan info */
+    int rpm = get_fan_rpm();
+    int level = get_fan_level();
+    if (rpm >= 0 && level >= 0) {
+        snprintf(tmp, sizeof(tmp), "Fan: %dRPM (L%d)", rpm, level);
+    } else if (rpm >= 0) {
+        snprintf(tmp, sizeof(tmp), "Fan: %d RPM", rpm);
+    } else {
+        snprintf(tmp, sizeof(tmp), "Fan: off");
+    }
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 2;
+
+    /* Board temp (MCU) */
+    int bt = get_board_temp();
+    if (bt >= 0) {
+        snprintf(tmp, sizeof(tmp), "Board: %dC", bt);
+        draw_str(8, y, tmp, temp_color(bt), COL_BG, s);
+        y += 8 * s + 2;
+    }
+
+    /* All thermal zones in compact 2-column grid */
+    static const char *zone_names[] = {
+        "Pkg", "Big", "Ltl", "GPU", "NPU", "DDR"
+    };
+    for (int i = 0; i < 6; i += 2) {
+        char path[64];
+        int t1 = -1, t2 = -1;
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+        t1 = read_sysfs_int(path);
+        if (t1 > 0) t1 /= 1000;
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i+1);
+        t2 = read_sysfs_int(path);
+        if (t2 > 0) t2 /= 1000;
+
+        char col1[16], col2[16];
+        if (t1 >= 0)
+            snprintf(col1, sizeof(col1), "%s:%dC", zone_names[i], t1);
+        else
+            snprintf(col1, sizeof(col1), "%s:--", zone_names[i]);
+
+        if (i + 1 < 6 && t2 >= 0)
+            snprintf(col2, sizeof(col2), "%s:%dC", zone_names[i+1], t2);
+        else if (i + 1 < 6)
+            snprintf(col2, sizeof(col2), "%s:--", zone_names[i+1]);
+        else
+            col2[0] = '\0';
+
+        draw_str(8, y, col1, (t1 >= 0) ? temp_color(t1) : COL_DIM, COL_BG, s);
+        if (col2[0])
+            draw_str(8 + DISP_W / 2, y, col2, (t2 >= 0) ? temp_color(t2) : COL_DIM, COL_BG, s);
+        y += 8 * s + 1;
+    }
+    y += 3;
+
+    return y;
+}
+
+static int render_system(int y)
+{
+    char tmp[64];
+    int s = cfg.font_scale;
+
+    y = section_header(y, "SYSTEM");
 
     int cpu_c = get_cpu_temp();
     int mem_used, mem_total;
     get_memory(&mem_used, &mem_total);
-    snprintf(tmp, sizeof(tmp), "CPU %dC  Mem %d/%dM",
-             cpu_c, mem_used, mem_total);
-    draw_str(8, y, tmp, COL_WHITE, COL_BLACK, 1);
-    y += 10;
+    snprintf(tmp, sizeof(tmp), "CPU %dC  Mem %d/%dM", cpu_c, mem_used, mem_total);
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 2;
 
     char upstr[32];
     get_uptime_str(upstr, sizeof(upstr));
     snprintf(tmp, sizeof(tmp), "Up: %s", upstr);
-    draw_str(8, y, tmp, COL_WHITE, COL_BLACK, 1);
+    draw_str(8, y, tmp, COL_FG, COL_BG, s);
+    y += 8 * s + 4;
+
+    return y;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Signal handler                                                     */
-/* ------------------------------------------------------------------ */
+static int render_custom(int y)
+{
+    int s = cfg.font_scale;
+
+    if (cfg.num_custom == 0) return y;
+
+    y = section_header(y, "CUSTOM");
+
+    for (int i = 0; i < cfg.num_custom && y < DISP_H - 10; i++) {
+        struct custom_param *p = &cfg.custom[i];
+        char val[128];
+
+        if (strncmp(p->source, "cmd:", 4) == 0) {
+            run_cmd(p->source + 4, val, sizeof(val));
+        } else {
+            /* sysfs read */
+            if (read_sysfs(p->source, val, sizeof(val)) < 0)
+                strncpy(val, "N/A", sizeof(val));
+            else if (p->divide > 0) {
+                int v = atoi(val);
+                if (p->divide == 1000)
+                    snprintf(val, sizeof(val), "%d.%03d", v / 1000, abs(v % 1000));
+                else
+                    snprintf(val, sizeof(val), "%d", v / p->divide);
+            }
+        }
+
+        char line[128];
+        if (p->unit[0])
+            snprintf(line, sizeof(line), "%s: %s%s", p->label, val, p->unit);
+        else
+            snprintf(line, sizeof(line), "%s: %s", p->label, val);
+
+        draw_str(8, y, line, COL_FG, COL_BG, s);
+        y += 8 * s + 2;
+    }
+    y += 2;
+
+    return y;
+}
+
+/* ================================================================== */
+/*  Top bar (always shown when no clock page)                          */
+/* ================================================================== */
+
+static int render_topbar(void)
+{
+    char tmp[32];
+    int s = cfg.font_scale;
+    int bar_h = 16 * s + 2;
+
+    fb_rect(0, 0, DISP_W, bar_h, COL_TOPBAR);
+
+    /* time */
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
+    draw_str(4, 2 * s, tmp, COL_FG, COL_TOPBAR, s * 2);
+
+    /* battery % */
+    int bpct = get_battery_pct();
+    if (bpct >= 0) {
+        snprintf(tmp, sizeof(tmp), "%d%%", bpct);
+        uint16_t bcol = (bpct > 20) ? COL_GOOD : (bpct > 10 ? COL_WARN : COL_BAD);
+        draw_str_r(DISP_W - 4, 2 * s, tmp, bcol, COL_TOPBAR, s * 2);
+    }
+
+    /* separator lines */
+    fb_hline(0, bar_h,     DISP_W, COL_ACCENT);
+    fb_hline(0, bar_h + 1, DISP_W, COL_ACCENT);
+
+    return bar_h + 4;
+}
+
+/* ================================================================== */
+/*  Full render                                                        */
+/* ================================================================== */
+
+static void render_screen(void)
+{
+    fb_clear(COL_BG);
+
+    int y;
+    int has_clock_page = 0;
+
+    /* check if clock is a page (renders its own large time) */
+    for (int i = 0; i < cfg.num_pages; i++)
+        if (strcmp(cfg.pages[i], "clock") == 0) has_clock_page = 1;
+
+    /* top bar only if no clock page (clock page has its own big time) */
+    if (!has_clock_page)
+        y = render_topbar();
+    else
+        y = 2;
+
+    for (int i = 0; i < cfg.num_pages && y < DISP_H - 10; i++) {
+        const char *p = cfg.pages[i];
+        if      (strcmp(p, "clock")   == 0) y = render_clock(y);
+        else if (strcmp(p, "battery") == 0) y = render_battery(y);
+        else if (strcmp(p, "network") == 0) y = render_network(y);
+        else if (strcmp(p, "wifi")    == 0) y = render_wifi(y);
+        else if (strcmp(p, "thermal") == 0) y = render_thermal(y);
+        else if (strcmp(p, "system")  == 0) y = render_system(y);
+        else if (strcmp(p, "custom")  == 0) y = render_custom(y);
+    }
+}
+
+/* ================================================================== */
+/*  Signal handlers                                                    */
+/* ================================================================== */
 
 static void sig_handler(int sig)
 {
-    (void)sig;
-    running = 0;
+    if (sig == SIGHUP) reload_cfg = 1;
+    else running = 0;
 }
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /*  main                                                               */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 int main(void)
 {
     signal(SIGTERM, sig_handler);
     signal(SIGINT,  sig_handler);
+    signal(SIGHUP,  sig_handler);
 
-    /* initialise SPI */
+    config_load();
+
     if (spi_init() < 0) { fprintf(stderr, "SPI init failed\n"); return 1; }
 
-    /* request GPIO lines via chardev (/dev/gpiochipN) */
     dc_line_fd  = gpio_request_output(DC_BANK,  DC_OFFSET,  "pcat2-dc",  0);
     rst_line_fd = gpio_request_output(RST_BANK, RST_OFFSET, "pcat2-rst", 1);
     bl_line_fd  = gpio_request_output(BL_BANK,  BL_OFFSET,  "pcat2-bl",  0);
@@ -775,18 +1172,30 @@ int main(void)
             DC_BANK, DC_OFFSET, RST_BANK, RST_OFFSET, BL_BANK, BL_OFFSET);
 
     disp_init();
-    fprintf(stderr, "pcat2-display: display initialised (%dx%d)\n",
-            DISP_W, DISP_H);
+    fprintf(stderr, "pcat2-display: display initialised (%dx%d) theme=%s refresh=%ds\n",
+            DISP_W, DISP_H, cfg.theme, cfg.refresh);
 
-    /* main loop */
+    /* apply initial backlight state */
+    gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
+
     while (running) {
-        render_screen();
-        fb_flush();
-        for (int i = 0; i < UPDATE_SEC * 10 && running; i++)
-            usleep(100000);     /* sleep in 100 ms slices so we exit fast */
+        if (reload_cfg) {
+            reload_cfg = 0;
+            config_load();
+            gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
+            fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d\n",
+                    cfg.theme, cfg.refresh, cfg.backlight);
+        }
+
+        if (cfg.backlight) {
+            render_screen();
+            fb_flush();
+        }
+
+        for (int i = 0; i < cfg.refresh * 10 && running && !reload_cfg; i++)
+            usleep(100000);
     }
 
-    /* cleanup */
     disp_sleep();
 
     if (dc_line_fd  >= 0) close(dc_line_fd);

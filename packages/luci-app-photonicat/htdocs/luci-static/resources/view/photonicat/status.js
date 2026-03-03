@@ -33,6 +33,17 @@ var callSetCPUGovernor = rpc.declare({
 	params: ['governor']
 });
 
+var callGetDisplayConfig = rpc.declare({
+	object: 'luci.photonicat',
+	method: 'get_display_config'
+});
+
+var callSetDisplayConfig = rpc.declare({
+	object: 'luci.photonicat',
+	method: 'set_display_config',
+	params: ['backlight', 'refresh', 'theme', 'font_scale', 'pages']
+});
+
 /* ── helpers ─────────────────────────────────────────────── */
 
 function tempColor(temp) {
@@ -79,17 +90,19 @@ function section(title, content) {
 
 return view.extend({
 	_status: {},
+	_displayConfig: {},
 	_fanModeButtons: {},
 	_fanLevelSlider: null,
 	_fanLevelLabel: null,
 	_govSelect: null,
 
 	load: function() {
-		return Promise.all([callGetStatus()]);
+		return Promise.all([callGetStatus(), callGetDisplayConfig()]);
 	},
 
 	render: function(data) {
 		this._status = data[0] || {};
+		this._displayConfig = data[1] || {};
 
 		var statusDiv = E('div', { 'id': 'pcat-status' });
 		var controlsDiv = E('div', { 'id': 'pcat-controls' });
@@ -342,7 +355,8 @@ return view.extend({
 						])
 					])
 				])
-			])
+			]),
+			this.renderDisplayControls()
 		]);
 	},
 
@@ -387,6 +401,154 @@ return view.extend({
 
 	handleGovernor: function(ev) {
 		callSetCPUGovernor(ev.target.value);
+	},
+
+	/* ── Display controls ────────────────────────────────── */
+
+	renderDisplayControls: function() {
+		var dc = this._displayConfig;
+		var allPages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+		var activePages = dc.pages || ['clock', 'battery', 'network', 'wifi', 'thermal', 'system'];
+		var themes = ['dark', 'light', 'green', 'cyan', 'amber'];
+
+		/* Backlight toggle */
+		var blOn  = E('button', {
+			'class': 'cbi-button' + (dc.backlight ? ' cbi-button-positive' : ''),
+			'click': L.bind(this.handleDisplayApply, this, { backlight: 1 }),
+			'style': 'margin-right:6px;'
+		}, _('On'));
+		var blOff = E('button', {
+			'class': 'cbi-button' + (!dc.backlight ? ' cbi-button-positive' : ''),
+			'click': L.bind(this.handleDisplayApply, this, { backlight: 0 }),
+			'style': 'margin-right:6px;'
+		}, _('Off'));
+
+		/* Theme selector */
+		var themeSelect = E('select', {
+			'class': 'cbi-input-select',
+			'id': 'disp-theme',
+			'change': L.bind(function(ev) {
+				this.handleDisplayApply({ theme: ev.target.value });
+			}, this)
+		});
+		for (var i = 0; i < themes.length; i++) {
+			var opt = E('option', { 'value': themes[i] }, themes[i].charAt(0).toUpperCase() + themes[i].slice(1));
+			if (themes[i] === (dc.theme || 'dark')) opt.selected = true;
+			themeSelect.appendChild(opt);
+		}
+
+		/* Refresh rate */
+		var refreshLabel = E('span', { 'style': 'font-weight:bold; min-width:2em; display:inline-block;' },
+			String(dc.refresh || 5));
+		var refreshSlider = E('input', {
+			'type': 'range', 'min': '1', 'max': '30',
+			'value': String(dc.refresh || 5),
+			'style': 'width:200px; vertical-align:middle;',
+			'id': 'disp-refresh',
+			'input': L.bind(function(ev) {
+				refreshLabel.textContent = ev.target.value;
+			}, this),
+			'change': L.bind(function(ev) {
+				this.handleDisplayApply({ refresh: parseInt(ev.target.value) });
+			}, this)
+		});
+
+		/* Font scale */
+		var scaleSelect = E('select', {
+			'class': 'cbi-input-select',
+			'id': 'disp-scale',
+			'change': L.bind(function(ev) {
+				this.handleDisplayApply({ font_scale: parseInt(ev.target.value) });
+			}, this)
+		});
+		for (var s = 1; s <= 3; s++) {
+			var sopt = E('option', { 'value': String(s) }, s + 'x');
+			if (s === (dc.font_scale || 1)) sopt.selected = true;
+			scaleSelect.appendChild(sopt);
+		}
+
+		/* Pages checkboxes */
+		var pageLabels = {
+			clock: 'Clock', battery: 'Battery', network: 'Network',
+			wifi: 'WiFi', thermal: 'Thermal', system: 'System', custom: 'Custom'
+		};
+		var pageChecks = [];
+		for (var p = 0; p < allPages.length; p++) {
+			var pg = allPages[p];
+			var checked = false;
+			for (var k = 0; k < activePages.length; k++) {
+				if (activePages[k] === pg) { checked = true; break; }
+			}
+			var cb = E('label', { 'style': 'margin-right:14px; white-space:nowrap;' }, [
+				E('input', {
+					'type': 'checkbox',
+					'data-page': pg,
+					'checked': checked ? '' : null,
+					'change': L.bind(this.handlePagesChange, this),
+					'style': 'margin-right:4px;'
+				}),
+				pageLabels[pg] || pg
+			]);
+			pageChecks.push(cb);
+		}
+
+		return E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('Display')),
+			E('div', { 'class': 'cbi-section-node' }, [
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, _('Backlight')),
+					E('div', { 'class': 'cbi-value-field' }, [blOn, blOff])
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, _('Theme')),
+					E('div', { 'class': 'cbi-value-field' }, [themeSelect])
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, _('Refresh')),
+					E('div', { 'class': 'cbi-value-field' }, [
+						refreshSlider,
+						E('span', { 'style': 'margin-left:10px;' }, [refreshLabel, E('span', {}, 's')])
+					])
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, _('Font Scale')),
+					E('div', { 'class': 'cbi-value-field' }, [scaleSelect])
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, _('Pages')),
+					E('div', { 'class': 'cbi-value-field', 'style': 'display:flex; flex-wrap:wrap;' }, pageChecks)
+				])
+			])
+		]);
+	},
+
+	handleDisplayApply: function(overrides) {
+		var dc = this._displayConfig;
+		var opts = {
+			backlight:  (overrides.backlight != null) ? overrides.backlight : dc.backlight,
+			refresh:    overrides.refresh || dc.refresh || 5,
+			theme:      overrides.theme || dc.theme || 'dark',
+			font_scale: overrides.font_scale || dc.font_scale || 1,
+			pages:      overrides.pages || dc.pages || ['clock','battery','network','wifi','thermal','system']
+		};
+
+		/* Update local cache */
+		for (var k in overrides)
+			dc[k] = overrides[k];
+
+		callSetDisplayConfig(opts.backlight, opts.refresh, opts.theme, opts.font_scale, opts.pages);
+	},
+
+	handlePagesChange: function() {
+		var allPages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+		var selected = [];
+		for (var i = 0; i < allPages.length; i++) {
+			var cb = document.querySelector('input[data-page="' + allPages[i] + '"]');
+			if (cb && cb.checked)
+				selected.push(allPages[i]);
+		}
+		if (selected.length > 0)
+			this.handleDisplayApply({ pages: selected });
 	},
 
 	handleSave: null,

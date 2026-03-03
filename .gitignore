@@ -20,3 +20,4 @@ Thumbs.db
 
 # Firmware extracts (large binary blobs)
 fw_extract/
+*.bak
