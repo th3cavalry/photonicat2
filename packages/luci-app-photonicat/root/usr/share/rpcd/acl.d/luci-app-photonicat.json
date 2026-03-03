@@ -4,7 +4,8 @@
 		"read": {
 			"ubus": {
 				"luci.photonicat": [
-					"get_status"
+					"get_status",
+					"get_display_config"
 				]
 			},
 			"file": {
@@ -30,7 +31,8 @@
 					"set_fan_mode",
 					"set_fan_level",
 					"set_fan_curve",
-					"set_cpu_governor"
+					"set_cpu_governor",
+					"set_display_config"
 				]
 			},
 			"uci": ["photonicat"],
