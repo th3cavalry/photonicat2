@@ -1,8 +1,9 @@
 # Photonicat 2 MCU Serial Protocol Specification
 
 > **Status:** Reverse-engineered from the GPL-licensed `photonicat-pm` kernel driver
-> by Kyosuke Nekoyashiki. This document describes the binary protocol between the
-> host CPU (RK3576) and the onboard power management MCU.
+> by Kyosuke Nekoyashiki, supplemented with live probing of the MCU via
+> `/dev/pcat-pm-ctl`. This document describes the binary protocol between the
+> host CPU (RK3576) and the onboard Renesas RA2E1 power management MCU.
 
 ## Physical Layer
 
@@ -12,8 +13,9 @@
 | Default baud rate | 115200 |
 | Parity | None |
 | Flow control | None |
-| DT node | `uart10` (`serial@2adc0000`) on RK3576 |
+| DT node | `uart10` (`serial@2afc0000`) on RK3576 |
 | DT compatible | `photonicat-pm` |
+| MCU chip | Renesas RA2E1 (from FW version string) |
 
 The MCU is connected to UART10 on the RK3576. The device tree also references a `power-gpios` line used to signal the MCU during shutdown.
 
@@ -256,12 +258,112 @@ Set the fan speed.
 
 The thermal cooling device exposes 10 states (0–9), where 0 = off.
 
-### 0x19 — Net Status LED Setup
+### 0x03 — HW Version Get
 
-Control the power button LED. The exact payload format is still under investigation.
+Query the MCU hardware version string.
 
 - **Direction:** Host → MCU
-- **Payload:** TBD
+- **Payload:** None
+
+**ACK (0x04):** Variable-length ASCII string.
+
+Example response: `NT2421A3` — "NT24" model identifier, "21A3" hardware revision.
+
+### 0x05 — FW Version Get
+
+Query the MCU firmware version string.
+
+- **Direction:** Host → MCU
+- **Payload:** None
+
+**ACK (0x06):** Variable-length ASCII string.
+
+Example response: `RA2E1250922000` — parsed as:
+- `RA2E1` — MCU chip: Renesas RA2E1
+- `250922` — Firmware date: 2025-09-22
+- `000` — Build number
+
+### 0x0B — Schedule Startup Time Set
+
+Set a scheduled power-on time. The MCU will power on the board at the specified time.
+
+- **Direction:** Host → MCU
+- **Payload:** 7 bytes (same format as Date/Time Sync) or 0 bytes (query)
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| 0 | 2 | u16 LE | Year |
+| 2 | 1 | u8 | Month |
+| 3 | 1 | u8 | Day |
+| 4 | 1 | u8 | Hour |
+| 5 | 1 | u8 | Minute |
+| 6 | 1 | u8 | Second |
+
+**ACK (0x0C):** 1 byte — `0x01` = success, `0x00` = no schedule set (query response).
+
+Sending all-zero payload clears the schedule. Query (no payload) returns `0x00` if no schedule is set.
+
+### 0x15 — Charger On Auto Start
+
+Configure whether the device automatically powers on when a charger is connected.
+
+- **Direction:** Host → MCU
+- **Payload:** 0 bytes (query) or 1 byte (set)
+
+| Value | Meaning |
+|-------|---------|
+| `0x00` | Disable auto-start on charger |
+| `0x01` | Enable auto-start on charger |
+
+**ACK (0x16):** 1 byte — current setting (`0x00`/`0x01`).
+
+> **Note:** On PM version 2 firmware (tested 250922000), the query always returns `0x00` regardless of the
+> set value. The setting may be stored but not readable, or this command may not be fully implemented.
+
+### 0x17 — Voltage Threshold Set
+
+Set the low-battery voltage threshold for automatic shutdown.
+
+- **Direction:** Host → MCU
+- **Payload:** 0 bytes (query) or 2 bytes (set)
+
+Set payload: 2-byte little-endian voltage in millivolts.
+
+**ACK (0x18):** 1 byte — `0x01` = success. Query returns `0x01` (meaning unclear).
+
+### 0x19 — Net Status LED Setup
+
+Control the power button LED. All tested payloads (1-3 bytes) are accepted by the MCU
+with an ACK of `0x01` (success). Physical observation is needed to determine exact behavior.
+
+- **Direction:** Host → MCU
+- **Payload:** Variable (1–3 bytes)
+
+Suspected format based on similar devices:
+
+| Byte | Field | Meaning |
+|------|-------|---------|
+| 0 | Mode | 0=off, 1=on, 2=blink, 3=breathe |
+| 1 | Rate/Color | Blink rate or color index |
+| 2 | Brightness | Brightness level |
+
+**ACK (0x1A):** 1 byte — `0x01` = success.
+
+### 0x1B — Power On Event Get
+
+Query what caused the most recent power-on.
+
+- **Direction:** Host → MCU
+- **Payload:** None
+
+**ACK (0x1C):** 1 byte — event code:
+
+| Value | Meaning |
+|-------|---------|
+| `0x00` | Charger inserted |
+| `0x01` | Power button press |
+| `0x02` | Scheduled startup |
+| `0x03` | Watchdog reset |
 
 ### 0x0D — PMU Request Shutdown
 
@@ -352,17 +454,98 @@ The driver creates `/sys/kernel/photonicat-pm/movement_trigger`:
 
 ---
 
+## Discovered Unknown Commands
+
+These commands were found via full command scan (0x00–0xC0) on PM version 2
+firmware (RA2E1250922000). The MCU responds to all odd command IDs with cmd+1 ACK.
+Most return a single byte `0x01` (generic success/ACK). Commands returning
+non-trivial values:
+
+| Command | ACK | Response | Interpretation |
+|---------|-----|----------|----------------|
+| `0x8B` | `0x8C` | 2 bytes LE (e.g., 0xF23 = 3875) | ADC reading (stable, purpose unknown) |
+| `0x8D` | `0x8E` | 1 byte (`0x00`) | Boolean state (disabled) |
+| `0x99` | `0x9A` | 1 byte (e.g., `0x2F` = 47) | Board/MCU temperature in °C |
+| `0x9B` | `0x9C` | 1 byte (`0xFF`) | Unset/disabled sentinel |
+| `0x9F` | `0xA0` | 1 byte (`0x02`) | PM version (matches DT pm-version=2) |
+
+All other scanned commands (0x1D–0x30, 0x81–0x92, 0x97–0xC0 excluding above)
+return a 1-byte `0x01` ACK with no additional data.
+
+> **Note:** The MCU appears to ACK any valid frame with `cmd+1`, even for
+> unrecognized command IDs. A response of `0x01` likely means "received, no error"
+> rather than indicating the command did something meaningful.
+
+---
+
+## /dev/pcat-pm-ctl Buffer Behavior
+
+The ctl device buffer accumulates **all** responses not handled internally by the
+kernel driver. This includes heartbeat ACK frames (cmd=0x02) generated ~1/sec.
+Userspace tools must drain stale buffer data before sending commands and filter
+responses by matching the expected ACK command ID.
+
+### Commands filtered by the kernel (NOT forwarded to ctl):
+
+**On receive from MCU:**
+- `0x07` STATUS_REPORT → parsed into power_supply/hwmon/rtc
+- `0x0A` DATE_TIME_SYNC_ACK → logged if error
+- `0x10` HOST_REQUEST_SHUTDOWN_ACK → sets poweroff_ok flag
+- `0x95` DEVICE_MOVEMENT → updates movement timestamp
+
+**On send from userspace (blocked):**
+- `0x01`/`0x02` HEARTBEAT — handled by kworker
+- `0x07`/`0x08` STATUS_REPORT
+- `0x09`/`0x0A` DATE_TIME_SYNC
+- `0x0F`/`0x10` HOST_SHUTDOWN
+- `0x13`/`0x14` WATCHDOG
+- `0x93`/`0x94` FAN_SET
+
+---
+
+## Fan Control
+
+The fan is controlled via the thermal cooling device framework:
+
+- **Cooling device:** `/sys/class/thermal/cooling_device0/` (type: `pcat-pm-fan`)
+- **States:** 0–9 (0 = off, 9 = max)
+- **hwmon:** `pcat_pm_hwmon_speed_fan` → `fan1_input` (RPM)
+
+### Fan Speed Mapping
+
+| Level | Raw byte | Approx RPM |
+|-------|----------|------------|
+| 0 | 0 | 0 (off) |
+| 1 | 20 | ~2400 |
+| 2 | 30 | TBD |
+| 3 | 40 | TBD |
+| 4 | 50 | TBD |
+| 5 | 60 | TBD |
+| 6 | 70 | TBD |
+| 7 | 80 | TBD |
+| 8 | 90 | TBD |
+| 9 | 100 | TBD |
+
+The fan cooling device is registered via device tree but is **not bound to any
+thermal zone** by default. It requires userspace fan control (daemon or LuCI app)
+to manage fan speed based on temperature.
+
+---
+
 ## TODO / Unknown
 
-- [ ] Exact payload format for `0x19` (Net Status LED Setup)
-- [ ] Payload details for `0x15` (Charger On Auto Start)
-- [ ] Payload details for `0x17` (Voltage Threshold Set)
-- [ ] Payload details for `0x0B` (Schedule Startup Time Set)
-- [ ] Payload details for `0x1B`/`0x1C` (Power On Event)
-- [ ] HW/FW version response formats (`0x04`, `0x06`)
+- [x] HW/FW version response formats (`0x04`, `0x06`) — documented
+- [x] Power On Event values (`0x1C`) — documented
+- [x] Schedule Startup Time Set format — documented
+- [x] Charger Auto Start behavior — documented (query broken on v2)
+- [x] Voltage Threshold Set — documented
+- [ ] LED Setup physical behavior (need visual observation)
 - [ ] Accelerometer units and calibration
 - [ ] GPIO input/output bitmask meanings (bytes 4–7 of status report)
 - [ ] Factory reset behavior details
-- [ ] LED color/pattern control specifics
+- [ ] Map fan RPM at each level (1–9)
+- [ ] Identify 0x8B ADC reading purpose
+- [ ] Confirm 0x99 is standalone temp vs status report temp
+- [ ] Purpose of commands 0x8D, 0x9B
 
 These can be investigated by capturing traffic on the device via `/dev/pcat-pm-ctl` or by sniffing UART10 directly.
