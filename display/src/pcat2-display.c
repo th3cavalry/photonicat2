@@ -25,8 +25,10 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/statvfs.h>
 #include <linux/spi/spidev.h>
 #include <linux/gpio.h>
+#include <linux/input.h>
 
 /* ================================================================== */
 /*  Hardware constants                                                 */
@@ -168,14 +170,13 @@ static void config_defaults(void)
     strncpy(cfg.theme, "dark", sizeof(cfg.theme));
     cfg.font_scale = 1.0f;
 
-    /* default pages */
-    cfg.num_pages = 6;
-    strncpy(cfg.pages[0], "clock", sizeof(cfg.pages[0]));
-    strncpy(cfg.pages[1], "battery", sizeof(cfg.pages[1]));
-    strncpy(cfg.pages[2], "network", sizeof(cfg.pages[2]));
-    strncpy(cfg.pages[3], "wifi", sizeof(cfg.pages[3]));
-    strncpy(cfg.pages[4], "thermal", sizeof(cfg.pages[4]));
-    strncpy(cfg.pages[5], "system", sizeof(cfg.pages[5]));
+    /* default: 5-page cycling mode (short-press power button to cycle) */
+    cfg.num_pages = 5;
+    strncpy(cfg.pages[0], "clock",    sizeof(cfg.pages[0]));
+    strncpy(cfg.pages[1], "cellular", sizeof(cfg.pages[1]));
+    strncpy(cfg.pages[2], "battery",  sizeof(cfg.pages[2]));
+    strncpy(cfg.pages[3], "network",  sizeof(cfg.pages[3]));
+    strncpy(cfg.pages[4], "system",   sizeof(cfg.pages[4]));
 
     cfg.num_custom = 0;
 }
@@ -388,10 +389,13 @@ static const unsigned char font5x7[95][5] = {
 
 static volatile sig_atomic_t running    = 1;
 static volatile sig_atomic_t reload_cfg = 0;
+static volatile sig_atomic_t dump_screenshot = 0;
 static int spi_fd = -1;
 static int dc_line_fd  = -1;
 static int rst_line_fd = -1;
 static int bl_line_fd  = -1;
+static int input_fd    = -1;
+static int page_idx    = 0;
 
 static uint8_t fb[DISP_W * DISP_H * 2];
 
@@ -419,15 +423,24 @@ static int read_sysfs_int(const char *path)
     return atoi(buf);
 }
 
-static void run_cmd(const char *cmd, char *buf, size_t len)
+static int run_cmd(const char *cmd, char *buf, size_t len)
 {
     buf[0] = '\0';
     FILE *f = popen(cmd, "r");
-    if (!f) return;
-    if (fgets(buf, len, f) == NULL) buf[0] = '\0';
-    pclose(f);
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
+    if (!f) return -1;
+    size_t off = 0;
+    while (off < len - 1) {
+        size_t n = fread(buf + off, 1, len - 1 - off, f);
+        if (n == 0) break;
+        off += n;
+    }
+    buf[off] = '\0';
+    /* strip trailing whitespace */
+    while (off > 0 && (buf[off-1] == '\n' || buf[off-1] == '\r' ||
+                        buf[off-1] == ' '  || buf[off-1] == '\t'))
+        buf[--off] = '\0';
+    int rc = pclose(f);
+    return (rc == 0 && buf[0]) ? 0 : -1;
 }
 
 /* ================================================================== */
@@ -476,6 +489,62 @@ static void gpio_set(int line_fd, int value)
     vals.mask = 1;
     vals.bits = value ? 1 : 0;
     ioctl(line_fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals);
+}
+
+/* ================================================================== */
+/*  Power button input                                                 */
+/* ================================================================== */
+
+static void input_init(void)
+{
+    input_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+    if (input_fd < 0) {
+        fprintf(stderr, "pcat2-display: cannot open /dev/input/event0: %s\n",
+                strerror(errno));
+        return;
+    }
+    /* Grab exclusively so procd button handler won't trigger poweroff */
+    int grab = 1;
+    if (ioctl(input_fd, EVIOCGRAB, &grab) < 0)
+        fprintf(stderr, "pcat2-display: EVIOCGRAB: %s\n", strerror(errno));
+    fprintf(stderr, "pcat2-display: power button input ready\n");
+}
+
+/* Returns: 1 = short press, 2 = long press (>=3s), 0 = nothing */
+static int input_check(void)
+{
+    if (input_fd < 0) return 0;
+
+    static int pressed = 0;
+    static struct timespec press_ts;
+    struct input_event ev;
+    int result = 0;
+
+    while (read(input_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+        if (ev.type != EV_KEY || ev.code != KEY_POWER) continue;
+        if (ev.value == 1) {                /* key down */
+            pressed = 1;
+            clock_gettime(CLOCK_MONOTONIC, &press_ts);
+        } else if (ev.value == 0 && pressed) {  /* key up */
+            pressed = 0;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long ms = (now.tv_sec - press_ts.tv_sec) * 1000 +
+                      (now.tv_nsec - press_ts.tv_nsec) / 1000000;
+            result = (ms >= 3000) ? 2 : 1;
+        }
+    }
+
+    /* Detect ongoing long press (held >=3s without release) */
+    if (pressed) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long ms = (now.tv_sec - press_ts.tv_sec) * 1000 +
+                  (now.tv_nsec - press_ts.tv_nsec) / 1000000;
+        if (ms >= 3000) { pressed = 0; result = 2; }
+    }
+
+    return result;
 }
 
 /* ================================================================== */
@@ -658,6 +727,161 @@ static void draw_str_c(int y, const char *str,
 }
 
 /* ================================================================== */
+/*  Icon & widget drawing primitives                                   */
+/* ================================================================== */
+
+/* Vertical line */
+static void fb_vline(int x, int y, int h, uint16_t col)
+{
+    for (int dy = 0; dy < h; dy++) fb_pixel(x, y + dy, col);
+}
+
+/* Filled rounded-ish status dot (5x5 diamond/circle) */
+static void draw_dot(int cx, int cy, uint16_t col)
+{
+    fb_pixel(cx, cy-2, col);
+    for (int dx = -1; dx <= 1; dx++) fb_pixel(cx+dx, cy-1, col);
+    for (int dx = -2; dx <= 2; dx++) fb_pixel(cx+dx, cy,   col);
+    for (int dx = -1; dx <= 1; dx++) fb_pixel(cx+dx, cy+1, col);
+    fb_pixel(cx, cy+2, col);
+}
+
+/* Battery icon - 16w x 9h, returns width consumed */
+static int draw_battery_icon(int x, int y, int pct, int charging)
+{
+    uint16_t border = COL_DIM;
+    /* outer frame */
+    fb_hline(x+1, y,   12, border);          /* top */
+    fb_hline(x+1, y+8, 12, border);          /* bottom */
+    fb_vline(x,   y+1, 7, border);           /* left */
+    fb_vline(x+13,y+1, 7, border);           /* right */
+    /* nub */
+    fb_rect(x+14, y+2, 2, 5, border);
+
+    /* fill - 11 pixels wide max (x+1 to x+12) */
+    int fw = (11 * pct + 50) / 100;
+    if (fw < 0) fw = 0;
+    if (fw > 11) fw = 11;
+    uint16_t fc = (pct > 25) ? COL_GOOD : (pct > 10 ? COL_WARN : COL_BAD);
+    if (fw > 0) fb_rect(x+1, y+1, fw, 7, fc);
+
+    /* charging bolt overlay (small zigzag) */
+    if (charging) {
+        uint16_t bc = COL_WARN;
+        fb_pixel(x+7, y+1, bc); fb_pixel(x+6, y+2, bc);
+        fb_pixel(x+5, y+3, bc); fb_pixel(x+6, y+3, bc);
+        fb_pixel(x+7, y+3, bc); fb_pixel(x+8, y+3, bc);
+        fb_pixel(x+7, y+4, bc); fb_pixel(x+8, y+4, bc);
+        fb_pixel(x+7, y+5, bc); fb_pixel(x+6, y+6, bc);
+        fb_pixel(x+5, y+7, bc);
+    }
+    return 18;
+}
+
+/* WiFi signal bars icon - 12w x 9h */
+static void draw_wifi_icon(int x, int y, int clients, uint16_t col)
+{
+    uint16_t dim = COL_DIM;
+    /* 4 bars of increasing height */
+    fb_rect(x,   y+7, 2, 2, (clients>0) ? col : dim);  /* bar 1: 2px tall */
+    fb_rect(x+3, y+5, 2, 4, (clients>0) ? col : dim);  /* bar 2: 4px tall */
+    fb_rect(x+6, y+3, 2, 6, (clients>0) ? col : dim);  /* bar 3: 6px tall */
+    fb_rect(x+9, y+1, 2, 8, (clients>0) ? col : dim);  /* bar 4: 8px tall */
+}
+
+/* Up arrow (upload) - 7w x 5h */
+static void draw_arrow_up(int x, int y, uint16_t col)
+{
+    fb_pixel(x+3, y, col);
+    fb_pixel(x+2, y+1, col); fb_pixel(x+3, y+1, col); fb_pixel(x+4, y+1, col);
+    fb_pixel(x+1, y+2, col); fb_pixel(x+2, y+2, col); fb_pixel(x+3, y+2, col);
+    fb_pixel(x+4, y+2, col); fb_pixel(x+5, y+2, col);
+    fb_pixel(x+3, y+3, col); fb_pixel(x+3, y+4, col);
+}
+
+/* Down arrow (download) - 7w x 5h */
+static void draw_arrow_down(int x, int y, uint16_t col)
+{
+    fb_pixel(x+3, y, col); fb_pixel(x+3, y+1, col);
+    fb_pixel(x+1, y+2, col); fb_pixel(x+2, y+2, col); fb_pixel(x+3, y+2, col);
+    fb_pixel(x+4, y+2, col); fb_pixel(x+5, y+2, col);
+    fb_pixel(x+2, y+3, col); fb_pixel(x+3, y+3, col); fb_pixel(x+4, y+3, col);
+    fb_pixel(x+3, y+4, col);
+}
+
+/* Horizontal progress bar with border */
+static void draw_progress_bar(int x, int y, int w, int h, int pct,
+                              uint16_t fg, uint16_t border)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    /* outer border (1px) */
+    fb_hline(x, y, w, border);
+    fb_hline(x, y + h - 1, w, border);
+    fb_vline(x, y + 1, h - 2, border);
+    fb_vline(x + w - 1, y + 1, h - 2, border);
+
+    /* inner background (already COL_BG from fb_clear) */
+    /* fill */
+    int fw = (w - 2) * pct / 100;
+    if (fw > 0)
+        fb_rect(x + 1, y + 1, fw, h - 2, fg);
+}
+
+/* Page indicator dots at bottom of screen */
+static void draw_page_dots(int current, int total)
+{
+    if (total <= 1) return;
+    int spacing = 14;
+    int total_w = (total - 1) * spacing;
+    int sx = (DISP_W - total_w) / 2;
+    int dy = DISP_H - 8;
+
+    for (int i = 0; i < total; i++) {
+        int cx = sx + i * spacing;
+        uint16_t col = (i == current) ? COL_ACCENT : COL_DIM;
+        /* 5px filled diamond/dot */
+        fb_pixel(cx, dy - 2, col);
+        for (int dx = -1; dx <= 1; dx++) fb_pixel(cx + dx, dy - 1, col);
+        for (int dx = -2; dx <= 2; dx++) fb_pixel(cx + dx, dy, col);
+        for (int dx = -1; dx <= 1; dx++) fb_pixel(cx + dx, dy + 1, col);
+        fb_pixel(cx, dy + 2, col);
+    }
+}
+
+/* Small thermometer icon: 5w x 9h */
+static void draw_thermo_icon(int x, int y, uint16_t col)
+{
+    fb_pixel(x+2, y, col);
+    fb_vline(x+1, y+1, 5, col); fb_vline(x+3, y+1, 5, col);
+    /* fill inside */
+    fb_vline(x+2, y+3, 3, col);
+    /* bulb at bottom */
+    for (int dx = 0; dx <= 4; dx++) fb_pixel(x+dx, y+6, col);
+    for (int dx = 0; dx <= 4; dx++) fb_pixel(x+dx, y+7, col);
+    for (int dx = 1; dx <= 3; dx++) fb_pixel(x+dx, y+8, col);
+}
+
+/* Fan icon: simple 4-spoke propeller 9w x 9h */
+static void draw_fan_icon(int x, int y, uint16_t col)
+{
+    /* center hub */
+    fb_pixel(x+4, y+3, col); fb_pixel(x+3, y+4, col);
+    fb_pixel(x+4, y+4, col); fb_pixel(x+5, y+4, col);
+    fb_pixel(x+4, y+5, col);
+    /* blades */
+    fb_pixel(x+4, y,   col); fb_pixel(x+3, y+1, col); fb_pixel(x+4, y+1, col);  /* top */
+    fb_pixel(x+4, y+2, col);
+    fb_pixel(x+7, y+3, col); fb_pixel(x+7, y+4, col); fb_pixel(x+6, y+4, col);  /* right */
+    fb_pixel(x+8, y+4, col);
+    fb_pixel(x+4, y+8, col); fb_pixel(x+5, y+7, col); fb_pixel(x+4, y+7, col);  /* bottom */
+    fb_pixel(x+4, y+6, col);
+    fb_pixel(x+1, y+5, col); fb_pixel(x+1, y+4, col); fb_pixel(x+2, y+4, col);  /* left */
+    fb_pixel(x+0, y+4, col);
+}
+
+/* ================================================================== */
 /*  Data collection helpers                                            */
 /* ================================================================== */
 
@@ -805,6 +1029,210 @@ static int get_board_temp(void)
         }
     }
     return -1;
+}
+
+/* CPU usage percentage (delta-based from /proc/stat) */
+static int get_cpu_usage(void)
+{
+    static long prev_idle = 0, prev_total = 0;
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    char buf[256];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
+    fclose(f);
+
+    long user, nice, sys, idle, iow, irq, sirq, steal;
+    if (sscanf(buf, "cpu %ld %ld %ld %ld %ld %ld %ld %ld",
+               &user, &nice, &sys, &idle, &iow, &irq, &sirq, &steal) < 4)
+        return -1;
+
+    long total = user + nice + sys + idle + iow + irq + sirq + steal;
+    long idle_all = idle + iow;
+
+    int pct = 0;
+    if (prev_total > 0) {
+        long dt = total - prev_total;
+        long di = idle_all - prev_idle;
+        if (dt > 0) pct = (int)(100 * (dt - di) / dt);
+    }
+
+    prev_total = total;
+    prev_idle  = idle_all;
+    return pct;
+}
+
+/* Disk usage percentage for root filesystem */
+static int get_disk_usage_pct(void)
+{
+    struct statvfs st;
+    if (statvfs("/overlay", &st) != 0) {
+        if (statvfs("/", &st) != 0) return -1;
+    }
+    if (st.f_blocks == 0) return 0;
+    return (int)(100 * (st.f_blocks - st.f_bfree) / st.f_blocks);
+}
+
+/* ── Cellular modem helpers (uqmi / QMI) ────────────────────────── */
+
+/* Parse carrier, RAT, roaming from uqmi --get-serving-system JSON */
+static void get_cellular_info(char *carrier, size_t clen,
+                              char *rat,     size_t rlen,
+                              int *roaming)
+{
+    carrier[0] = '\0';
+    strncpy(rat, "?", rlen); rat[rlen-1] = '\0';
+    *roaming = 0;
+
+    char buf[512];
+    if (run_cmd("uqmi -d /dev/cdc-wdm0 --get-serving-system 2>/dev/null", buf, sizeof(buf)) != 0)
+        return;
+
+    /* parse plmn_description */
+    char *p = strstr(buf, "plmn_description");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++; while (*p == ' ' || *p == '"') p++;
+            char *e = strchr(p, '"');
+            if (e) { int n = e - p; if (n >= (int)clen) n = clen-1;
+                     memcpy(carrier, p, n); carrier[n] = '\0'; }
+        }
+    }
+
+    /* parse radio_interface - look for 5gnr, lte, umts, etc */
+    p = strstr(buf, "radio_interface");
+    if (p) {
+        if (strstr(p, "5gnr"))      strncpy(rat, "5G", rlen);
+        else if (strstr(p, "lte"))  strncpy(rat, "4G", rlen);
+        else if (strstr(p, "umts")) strncpy(rat, "3G", rlen);
+        else if (strstr(p, "gsm"))  strncpy(rat, "2G", rlen);
+        rat[rlen-1] = '\0';
+    }
+
+    /* parse roaming */
+    p = strstr(buf, "roaming");
+    if (p && strstr(p, "true")) *roaming = 1;
+}
+
+/* Get signal info: rsrp (dBm), snr (dB*10), rsrq (dB) */
+static void get_cellular_signal(int *rsrp, int *snr10, int *rsrq)
+{
+    *rsrp = 0; *snr10 = 0; *rsrq = 0;
+
+    char buf[256];
+    if (run_cmd("uqmi -d /dev/cdc-wdm0 --get-signal-info 2>/dev/null", buf, sizeof(buf)) != 0)
+        return;
+
+    char *p;
+    p = strstr(buf, "rsrp");
+    if (p) { p = strchr(p, ':'); if (p) *rsrp = atoi(p+1); }
+    p = strstr(buf, "snr");
+    if (p) { p = strchr(p, ':'); if (p) *snr10 = (int)(atof(p+1) * 10); }
+    p = strstr(buf, "rsrq");
+    if (p) { p = strchr(p, ':'); if (p) *rsrq = atoi(p+1); }
+}
+
+/* Signal quality 0-4 from RSRP (dBm) */
+static int signal_bars(int rsrp)
+{
+    if (rsrp >= -80) return 4;
+    if (rsrp >= -90) return 3;
+    if (rsrp >= -100) return 2;
+    if (rsrp >= -110) return 1;
+    return 0;
+}
+
+/* Draw signal strength bars icon (cellular style) 11w x 9h */
+static void draw_signal_icon(int x, int y, int bars, uint16_t col)
+{
+    uint16_t dim = COL_DIM;
+    fb_rect(x,   y+7, 2, 2, (bars >= 1) ? col : dim);
+    fb_rect(x+3, y+5, 2, 4, (bars >= 2) ? col : dim);
+    fb_rect(x+6, y+3, 2, 6, (bars >= 3) ? col : dim);
+    fb_rect(x+9, y+1, 2, 8, (bars >= 4) ? col : dim);
+}
+
+/* Ping latency in ms (-1 on failure).  Non-blocking: runs in background,
+   we cache the last result and only re-ping every N seconds. */
+static int get_ping_ms(void)
+{
+    static int last_ms = -1;
+    static time_t last_ping = 0;
+    time_t now = time(NULL);
+
+    if (now - last_ping < 10)   /* re-ping every 10s */
+        return last_ms;
+    last_ping = now;
+
+    char buf[256];
+    if (run_cmd("ping -c1 -W2 1.1.1.1 2>/dev/null | tail -1", buf, sizeof(buf)) != 0) {
+        last_ms = -1;
+        return last_ms;
+    }
+    /* parse "round-trip min/avg/max = 34.696/34.696/34.696 ms" */
+    char *p = strstr(buf, "= ");
+    if (p) {
+        p += 2;
+        /* skip min, find avg after first / */
+        char *sl = strchr(p, '/');
+        if (sl) last_ms = (int)atof(sl + 1);
+        else last_ms = (int)atof(p);
+    } else {
+        last_ms = -1;
+    }
+    return last_ms;
+}
+
+/* Get phone number (MSISDN) from modem, cached */
+static void get_phone_number(char *buf, size_t len)
+{
+    static char cached[20] = "";
+    static int tried = 0;
+
+    if (!tried) {
+        tried = 1;
+        char raw[64];
+        if (run_cmd("uqmi -d /dev/cdc-wdm0 --get-msisdn 2>/dev/null", raw, sizeof(raw)) == 0) {
+            /* strip quotes: "18129879270" -> 18129879270 */
+            char *p = raw;
+            if (*p == '"') p++;
+            char *e = strchr(p, '"');
+            if (e) *e = '\0';
+            /* format as (812) 987-9270 if 10+ digits */
+            size_t sl = strlen(p);
+            if (sl >= 10) {
+                char *d = p + sl - 10; /* last 10 digits */
+                snprintf(cached, sizeof(cached), "(%c%c%c)%c%c%c-%c%c%c%c",
+                         d[0],d[1],d[2], d[3],d[4],d[5], d[6],d[7],d[8],d[9]);
+            } else {
+                strncpy(cached, p, sizeof(cached)-1);
+            }
+        }
+    }
+    strncpy(buf, cached[0] ? cached : "N/A", len);
+    buf[len-1] = '\0';
+}
+
+/* Get SMS count from modem (uqmi --list-messages).  Cached, refreshed every 30s */
+static int get_sms_count(void)
+{
+    static int count = 0;
+    static time_t last_check = 0;
+    time_t now = time(NULL);
+
+    if (now - last_check < 30)
+        return count;
+    last_check = now;
+
+    char buf[1024];
+    count = 0;
+    if (run_cmd("uqmi -d /dev/cdc-wdm0 --list-messages --storage me 2>/dev/null",
+                buf, sizeof(buf)) == 0) {
+        /* count "id" occurrences in JSON array */
+        char *p = buf;
+        while ((p = strstr(p, "\"id\"")) != NULL) { count++; p += 4; }
+    }
+    return count;
 }
 
 /* ================================================================== */
@@ -1077,6 +1505,702 @@ static int render_custom(int y)
 }
 
 /* ================================================================== */
+/*  Full-screen page renderers (one page per screen, button cycles)    */
+/* ================================================================== */
+
+static void render_fullpage_clock(void)
+{
+    char tmp[64];
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    int y;
+
+    /* Big time HH:MM centred */
+    y = 30;
+    snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
+    draw_str_c(y, tmp, COL_FG, COL_BG, 4.0f);
+    y += CHAR_H(4.0f) + 8;
+
+    /* Accent separator */
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 10;
+
+    /* Weekday */
+    static const char *wdays[] = {"Sunday","Monday","Tuesday","Wednesday",
+                                   "Thursday","Friday","Saturday"};
+    draw_str_c(y, wdays[t->tm_wday], COL_FG, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+
+    /* Date */
+    static const char *mons[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                  "Jul","Aug","Sep","Oct","Nov","Dec"};
+    snprintf(tmp, sizeof(tmp), "%s %d, %d",
+             mons[t->tm_mon], t->tm_mday, t->tm_year + 1900);
+    draw_str_c(y, tmp, COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 16;
+
+    /* Dim separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 12;
+
+    /* Uptime */
+    char upstr[32];
+    get_uptime_str(upstr, sizeof(upstr));
+    snprintf(tmp, sizeof(tmp), "Up: %s", upstr);
+    draw_str_c(y, tmp, COL_DIM, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 8;
+
+    /* Battery summary */
+    int bpct = get_battery_pct();
+    if (bpct >= 0) {
+        char bstat[32];
+        get_battery_status(bstat, sizeof(bstat));
+        int chg = (strstr(bstat, "Charging") || strstr(bstat, "Full"));
+        uint16_t bc = (bpct > 25) ? COL_GOOD : (bpct > 10 ? COL_WARN : COL_BAD);
+        snprintf(tmp, sizeof(tmp), "%d%% %s", bpct, chg ? "CHG" : "BAT");
+        draw_str_c(y, tmp, bc, COL_BG, 2.0f);
+    }
+}
+
+static void render_fullpage_cellular(void)
+{
+    char tmp[128];
+    int y = 8;
+
+    /* Header */
+    draw_str_c(y, "CELLULAR", COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 8;
+
+    char carrier[32], rat[8];
+    int roaming = 0;
+    get_cellular_info(carrier, sizeof(carrier), rat, sizeof(rat), &roaming);
+    int rsrp = 0, snr10 = 0, rsrq = 0;
+    get_cellular_signal(&rsrp, &snr10, &rsrq);
+    int bars = signal_bars(rsrp);
+
+    /* No modem fallback */
+    if (!carrier[0] && strcmp(rat, "?") == 0) {
+        y += 40;
+        draw_str_c(y, "No modem", COL_DIM, COL_BG, 2.0f);
+        y += CHAR_H(2.0f) + 8;
+        draw_str_c(y, "detected", COL_DIM, COL_BG, 2.0f);
+        return;
+    }
+
+    /* Carrier name */
+    if (carrier[0]) {
+        if (strlen(carrier) > 14) carrier[14] = '\0';
+        draw_str_c(y, carrier, COL_FG, COL_BG, 2.0f);
+    } else {
+        draw_str_c(y, "Searching..", COL_DIM, COL_BG, 2.0f);
+    }
+    y += CHAR_H(2.0f) + 6;
+
+    /* Roaming indicator */
+    if (roaming)
+        draw_str_r(DISP_W - 4, 8, "R", COL_WARN, COL_BG, 2.0f);
+
+    /* RAT badge - large */
+    {
+        uint16_t rc = COL_ACCENT;
+        if (strcmp(rat, "5G") == 0) rc = COL_GOOD;
+        else if (strcmp(rat, "3G") == 0 || strcmp(rat, "2G") == 0) rc = COL_WARN;
+        draw_str_c(y, rat, rc, COL_BG, 3.0f);
+        y += CHAR_H(3.0f) + 2;
+    }
+
+    /* Signal bars - large custom drawn */
+    {
+        int bw = 8, gap = 4, total_w = 4 * bw + 3 * gap;
+        int sx = (DISP_W - total_w) / 2;
+        int bar_base = y + 26;
+        int heights[] = {8, 14, 20, 26};
+        for (int i = 0; i < 4; i++) {
+            uint16_t col = (bars > i) ? COL_ACCENT : COL_DIM;
+            fb_rect(sx + i * (bw + gap), bar_base - heights[i],
+                    bw, heights[i], col);
+        }
+        y = bar_base + 8;
+    }
+
+    /* Separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 8;
+
+    /* RSRP */
+    {
+        uint16_t rc = (rsrp >= -90) ? COL_GOOD :
+                      (rsrp >= -110) ? COL_WARN : COL_BAD;
+        snprintf(tmp, sizeof(tmp), "%d dBm", rsrp);
+        draw_str_c(y, tmp, rc, COL_BG, 2.0f);
+        y += CHAR_H(2.0f) + 4;
+    }
+
+    /* SNR */
+    if (snr10 != 0) {
+        snprintf(tmp, sizeof(tmp), "SNR %d.%d dB", snr10 / 10, abs(snr10 % 10));
+        draw_str_c(y, tmp, COL_DIM, COL_BG, 1.5f);
+        y += CHAR_H(1.5f) + 4;
+    }
+
+    /* Ping */
+    {
+        int ping = get_ping_ms();
+        if (ping >= 0) {
+            uint16_t pc = (ping < 50) ? COL_GOOD :
+                          (ping < 100) ? COL_WARN : COL_BAD;
+            snprintf(tmp, sizeof(tmp), "%d ms", ping);
+            draw_str_c(y, tmp, pc, COL_BG, 2.0f);
+        } else {
+            draw_str_c(y, "--- ms", COL_BAD, COL_BG, 2.0f);
+        }
+        y += CHAR_H(2.0f) + 8;
+    }
+
+    /* Separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 8;
+
+    /* Phone number */
+    {
+        char phone[20];
+        get_phone_number(phone, sizeof(phone));
+        draw_str_c(y, phone, COL_FG, COL_BG, 1.5f);
+        y += CHAR_H(1.5f) + 4;
+    }
+
+    /* SMS count */
+    {
+        int sms = get_sms_count();
+        snprintf(tmp, sizeof(tmp), "%d SMS", sms);
+        draw_str_c(y, tmp, (sms > 0) ? COL_WARN : COL_DIM, COL_BG, 1.5f);
+    }
+}
+
+static void render_fullpage_battery(void)
+{
+    char tmp[64];
+    int y = 8;
+
+    /* Header */
+    draw_str_c(y, "BATTERY", COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 12;
+
+    int bpct = get_battery_pct();
+    char bstat[32];
+    get_battery_status(bstat, sizeof(bstat));
+
+    /* Big percentage */
+    if (bpct >= 0) {
+        uint16_t bcol = (bpct > 25) ? COL_GOOD :
+                        (bpct > 10 ? COL_WARN : COL_BAD);
+        snprintf(tmp, sizeof(tmp), "%d%%", bpct);
+        draw_str_c(y, tmp, bcol, COL_BG, 4.0f);
+        y += CHAR_H(4.0f) + 6;
+
+        /* Wide progress bar */
+        draw_progress_bar(10, y, DISP_W - 20, 14, bpct, bcol, COL_DIM);
+        y += 22;
+    } else {
+        draw_str_c(y, "N/A", COL_DIM, COL_BG, 3.0f);
+        y += CHAR_H(3.0f) + 6;
+    }
+
+    /* Status */
+    {
+        const char *ss = "Unknown";
+        uint16_t sc = COL_DIM;
+        if (strstr(bstat, "Charging"))    { ss = "Charging";     sc = COL_GOOD; }
+        else if (strstr(bstat, "Full"))   { ss = "Full";         sc = COL_GOOD; }
+        else if (strstr(bstat, "Dischar")){ ss = "Discharging";  sc = COL_WARN; }
+        else if (strstr(bstat, "Not"))    { ss = "Not Charging"; sc = COL_DIM;  }
+        draw_str_c(y, ss, sc, COL_BG, 2.0f);
+        y += CHAR_H(2.0f) + 10;
+    }
+
+    /* Separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 10;
+
+    /* Voltage */
+    int mv = get_battery_voltage_mv();
+    if (mv > 0) {
+        snprintf(tmp, sizeof(tmp), "%d.%02d V", mv / 1000, (mv % 1000) / 10);
+        draw_str_c(y, tmp, COL_FG, COL_BG, 2.0f);
+        y += CHAR_H(2.0f) + 6;
+    }
+
+    /* Current */
+    int ma = get_battery_current_ma();
+    if (ma >= 0) {
+        snprintf(tmp, sizeof(tmp), "%d mA", ma);
+        draw_str_c(y, tmp, COL_FG, COL_BG, 2.0f);
+    }
+}
+
+static void render_fullpage_network(void)
+{
+    char tmp[128];
+    int y = 8;
+
+    /* WAN header */
+    draw_str_c(y, "NETWORK", COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 8;
+
+    char wan_if[32] = "", wan_ip[64] = "N/A";
+    get_wan_info(wan_if, sizeof(wan_if), wan_ip, sizeof(wan_ip));
+    int is_up = 0;
+    if (wan_if[0]) {
+        char opstate[16] = "?";
+        snprintf(tmp, sizeof(tmp), "/sys/class/net/%s/operstate", wan_if);
+        read_sysfs(tmp, opstate, sizeof(opstate));
+        is_up = (strcmp(opstate, "up") == 0 || strcmp(opstate, "unknown") == 0);
+    }
+
+    /* WAN status */
+    draw_dot(12, y + 7, is_up ? COL_GOOD : COL_BAD);
+    snprintf(tmp, sizeof(tmp), "WAN %s", is_up ? "UP" : "DOWN");
+    draw_str(22, y, tmp, is_up ? COL_GOOD : COL_BAD, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+
+    /* Interface name */
+    if (wan_if[0]) {
+        draw_str(8, y, wan_if, COL_DIM, COL_BG, 1.5f);
+        y += CHAR_H(1.5f) + 4;
+    }
+
+    /* IP address */
+    draw_str_c(y, wan_ip, COL_FG, COL_BG, 1.5f);
+    y += CHAR_H(1.5f) + 12;
+
+    /* WiFi separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 10;
+
+    /* WiFi section */
+    draw_str_c(y, "WIFI", COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 8;
+
+    /* SSID */
+    char ssid[64];
+    get_wifi_ssid(ssid, sizeof(ssid));
+    int max_ch = DISP_W / CHAR_W(2.0f);
+    if ((int)strlen(ssid) > max_ch) ssid[max_ch] = '\0';
+    draw_str_c(y, ssid, COL_FG, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+
+    /* Band + Channel */
+    char bandchan[32];
+    get_wifi_band_chan(bandchan, sizeof(bandchan));
+    draw_str_c(y, bandchan, COL_DIM, COL_BG, 1.5f);
+    y += CHAR_H(1.5f) + 6;
+
+    /* Clients */
+    int clients = get_wifi_clients();
+    snprintf(tmp, sizeof(tmp), "%d clients", clients);
+    draw_str_c(y, tmp, (clients > 0) ? COL_GOOD : COL_DIM, COL_BG, 2.0f);
+}
+
+static void render_fullpage_system(void)
+{
+    char tmp[64];
+    int y = 8;
+
+    /* Header */
+    draw_str_c(y, "SYSTEM", COL_ACCENT, COL_BG, 2.0f);
+    y += CHAR_H(2.0f) + 4;
+    fb_hline(10, y, DISP_W - 20, COL_ACCENT);
+    y += 8;
+
+    /* CPU bar */
+    int cpu_pct = get_cpu_usage();
+    if (cpu_pct < 0) cpu_pct = 0;
+    draw_str(8, y, "CPU", COL_ACCENT, COL_BG, 1.5f);
+    snprintf(tmp, sizeof(tmp), "%d%%", cpu_pct);
+    draw_str_r(DISP_W - 8, y, tmp, COL_FG, COL_BG, 1.5f);
+    y += CHAR_H(1.5f) + 2;
+    {
+        uint16_t bc = (cpu_pct < 60) ? COL_GOOD :
+                      (cpu_pct < 85) ? COL_WARN : COL_BAD;
+        draw_progress_bar(8, y, DISP_W - 16, 12, cpu_pct, bc, COL_DIM);
+    }
+    y += 18;
+
+    /* MEM bar */
+    int mem_used, mem_total;
+    get_memory(&mem_used, &mem_total);
+    int mem_pct = (mem_total > 0) ? (100 * mem_used / mem_total) : 0;
+    draw_str(8, y, "MEM", COL_ACCENT, COL_BG, 1.5f);
+    snprintf(tmp, sizeof(tmp), "%d%%", mem_pct);
+    draw_str_r(DISP_W - 8, y, tmp, COL_FG, COL_BG, 1.5f);
+    y += CHAR_H(1.5f) + 2;
+    {
+        uint16_t mc = (mem_pct < 70) ? COL_GOOD :
+                      (mem_pct < 90) ? COL_WARN : COL_BAD;
+        draw_progress_bar(8, y, DISP_W - 16, 12, mem_pct, mc, COL_DIM);
+    }
+    y += 18;
+
+    /* DSK bar */
+    int dsk_pct = get_disk_usage_pct();
+    if (dsk_pct >= 0) {
+        draw_str(8, y, "DSK", COL_ACCENT, COL_BG, 1.5f);
+        snprintf(tmp, sizeof(tmp), "%d%%", dsk_pct);
+        draw_str_r(DISP_W - 8, y, tmp, COL_FG, COL_BG, 1.5f);
+        y += CHAR_H(1.5f) + 2;
+        {
+            uint16_t dc = (dsk_pct < 70) ? COL_GOOD :
+                          (dsk_pct < 90) ? COL_WARN : COL_BAD;
+            draw_progress_bar(8, y, DISP_W - 16, 12, dsk_pct, dc, COL_DIM);
+        }
+        y += 18;
+    }
+
+    /* Memory detail */
+    snprintf(tmp, sizeof(tmp), "%d / %d MB", mem_used, mem_total);
+    draw_str_c(y, tmp, COL_DIM, COL_BG, 1.0f);
+    y += CHAR_H(1.0f) + 6;
+
+    /* Separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 8;
+
+    /* Temperatures */
+    int cpu_c = get_cpu_temp();
+    int board_c = get_board_temp();
+
+    draw_thermo_icon(8, y, COL_ACCENT);
+    if (cpu_c > 0) {
+        snprintf(tmp, sizeof(tmp), "CPU %dC", cpu_c);
+        draw_str(20, y, tmp, temp_color(cpu_c), COL_BG, 2.0f);
+    }
+    y += CHAR_H(2.0f) + 4;
+
+    if (board_c >= 0) {
+        snprintf(tmp, sizeof(tmp), "Board %dC", board_c);
+        draw_str(20, y, tmp, temp_color(board_c), COL_BG, 1.5f);
+        y += CHAR_H(1.5f) + 6;
+    }
+
+    /* Fan */
+    int rpm = get_fan_rpm();
+    int level = get_fan_level();
+    draw_fan_icon(8, y, COL_ACCENT);
+    if (rpm >= 0) {
+        snprintf(tmp, sizeof(tmp), "%d RPM", rpm);
+        draw_str(20, y, tmp, COL_FG, COL_BG, 1.5f);
+        if (level >= 0) {
+            snprintf(tmp, sizeof(tmp), "L%d", level);
+            draw_str_r(DISP_W - 8, y, tmp, COL_ACCENT, COL_BG, 1.5f);
+        }
+    } else {
+        draw_str(20, y, "Fan OFF", COL_DIM, COL_BG, 1.5f);
+    }
+    y += CHAR_H(1.5f) + 8;
+
+    /* Separator */
+    fb_hline(10, y, DISP_W - 20, COL_DIM);
+    y += 8;
+
+    /* Uptime */
+    char upstr[32];
+    get_uptime_str(upstr, sizeof(upstr));
+    snprintf(tmp, sizeof(tmp), "Up: %s", upstr);
+    draw_str_c(y, tmp, COL_DIM, COL_BG, 1.5f);
+}
+
+/* ================================================================== */
+/*  Dashboard - single-screen unified status view                      */
+/* ================================================================== */
+
+static void render_dashboard(void)
+{
+    char tmp[128];
+    int y;
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+
+    /* ── TIME ─────────────────────────────────────────────── */
+    y = 2;
+    snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
+    draw_str_c(y, tmp, COL_FG, COL_BG, 3.5f);
+    y += CHAR_H(3.5f) + 1;
+
+    /* date */
+    static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char *mon[]  = {"Jan","Feb","Mar","Apr","May","Jun",
+                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+    snprintf(tmp, sizeof(tmp), "%s %s %d, %d",
+             wday[t->tm_wday], mon[t->tm_mon], t->tm_mday, t->tm_year + 1900);
+    draw_str_c(y, tmp, COL_DIM, COL_BG, 1.2f);
+    y += CHAR_H(1.2f) + 3;
+
+    /* accent double separator */
+    fb_hline(4, y,   DISP_W - 8, COL_ACCENT);
+    fb_hline(4, y+2, DISP_W - 8, COL_ACCENT);
+    y += 6;
+
+    /* ── CELLULAR ─────────────────────────────────────────── */
+    {
+        char carrier[32], rat[8];
+        int roaming = 0;
+        get_cellular_info(carrier, sizeof(carrier), rat, sizeof(rat), &roaming);
+
+        int rsrp = 0, snr10 = 0, rsrq = 0;
+        get_cellular_signal(&rsrp, &snr10, &rsrq);
+        int bars = signal_bars(rsrp);
+
+        /* Row 1: signal bars + carrier + RAT badge */
+        draw_signal_icon(4, y, bars, COL_ACCENT);
+        int cx = 18;
+        if (carrier[0]) {
+            /* truncate carrier to fit */
+            if (strlen(carrier) > 12) carrier[12] = '\0';
+            cx = draw_str(cx, y, carrier, COL_FG, COL_BG, 1.3f);
+            cx += 4;
+        }
+        /* RAT badge (5G / 4G / 3G) */
+        {
+            uint16_t rc = COL_ACCENT;
+            if (strcmp(rat, "5G") == 0) rc = COL_GOOD;
+            else if (strcmp(rat, "4G") == 0) rc = COL_ACCENT;
+            else rc = COL_WARN;
+            draw_str(cx, y, rat, rc, COL_BG, 1.3f);
+        }
+        if (roaming)
+            draw_str_r(DISP_W - 4, y, "R", COL_WARN, COL_BG, 1.0f);
+        y += CHAR_H(1.3f) + 2;
+
+        /* Row 2: RSRP + SNR + ping */
+        {
+            int ping = get_ping_ms();
+            snprintf(tmp, sizeof(tmp), "%ddBm", rsrp);
+            draw_str(6, y, tmp, COL_DIM, COL_BG, 1.0f);
+
+            if (ping >= 0) {
+                uint16_t pc = (ping < 50) ? COL_GOOD :
+                              (ping < 100) ? COL_WARN : COL_BAD;
+                snprintf(tmp, sizeof(tmp), "%dms", ping);
+                draw_str_r(DISP_W - 4, y, tmp, pc, COL_BG, 1.0f);
+            } else {
+                draw_str_r(DISP_W - 4, y, "---", COL_BAD, COL_BG, 1.0f);
+            }
+        }
+        y += CHAR_H(1.0f) + 1;
+
+        /* Row 3: phone number + SMS count */
+        {
+            char phone[20];
+            get_phone_number(phone, sizeof(phone));
+            draw_str(6, y, phone, COL_FG, COL_BG, 1.0f);
+
+            int sms = get_sms_count();
+            if (sms > 0) {
+                snprintf(tmp, sizeof(tmp), "%dSMS", sms);
+                draw_str_r(DISP_W - 4, y, tmp, COL_WARN, COL_BG, 1.0f);
+            } else {
+                draw_str_r(DISP_W - 4, y, "0SMS", COL_DIM, COL_BG, 1.0f);
+            }
+        }
+        y += CHAR_H(1.0f) + 3;
+    }
+
+    /* dim separator */
+    fb_hline(4, y, DISP_W - 8, COL_DIM);
+    y += 5;
+
+    /* ── BATTERY ──────────────────────────────────────────── */
+    {
+        int bpct = get_battery_pct();
+        char bstat[32];
+        get_battery_status(bstat, sizeof(bstat));
+        int charging = (strstr(bstat, "Charging") || strstr(bstat, "Full"));
+
+        int ix = 4;
+        if (bpct >= 0) {
+            draw_battery_icon(ix, y + 1, bpct, charging);
+            ix += 20;
+        }
+
+        /* percentage - big */
+        if (bpct >= 0) {
+            uint16_t bcol = (bpct > 25) ? COL_GOOD : (bpct > 10 ? COL_WARN : COL_BAD);
+            snprintf(tmp, sizeof(tmp), "%d%%", bpct);
+            ix = draw_str(ix, y, tmp, bcol, COL_BG, 1.5f);
+            ix += 4;
+        }
+
+        /* status */
+        {
+            const char *ss = "N/A";
+            if (strstr(bstat, "Charging"))    ss = "CHG";
+            else if (strstr(bstat, "Full"))   ss = "FULL";
+            else if (strstr(bstat, "Dischar"))ss = "BAT";
+            else if (strstr(bstat, "Not"))    ss = "IDLE";
+            uint16_t sc = charging ? COL_GOOD : COL_DIM;
+            draw_str(ix, y + 2, ss, sc, COL_BG, 1.0f);
+        }
+
+        /* voltage right-aligned */
+        {
+            int mv = get_battery_voltage_mv();
+            if (mv > 0) {
+                snprintf(tmp, sizeof(tmp), "%d.%02dV", mv/1000, (mv%1000)/10);
+                draw_str_r(DISP_W - 4, y + 2, tmp, COL_DIM, COL_BG, 1.0f);
+            }
+        }
+        y += CHAR_H(1.5f) + 3;
+    }
+
+    /* dim separator */
+    fb_hline(4, y, DISP_W - 8, COL_DIM);
+    y += 5;
+
+    /* ── NETWORK ──────────────────────────────────────────── */
+    {
+        char wan_if[32] = "", wan_ip[64] = "N/A";
+        get_wan_info(wan_if, sizeof(wan_if), wan_ip, sizeof(wan_ip));
+
+        int is_up = 0;
+        if (wan_if[0]) {
+            char opstate[16] = "?";
+            snprintf(tmp, sizeof(tmp), "/sys/class/net/%s/operstate", wan_if);
+            read_sysfs(tmp, opstate, sizeof(opstate));
+            is_up = (strcmp(opstate, "up") == 0 || strcmp(opstate, "unknown") == 0);
+        }
+
+        /* WAN: dot + iface + IP */
+        draw_dot(8, y + 4, is_up ? COL_GOOD : COL_BAD);
+        int nx = 15;
+        nx = draw_str(nx, y, "WAN", COL_ACCENT, COL_BG, 1.2f);
+        nx += 4;
+        draw_str(nx, y + 1, wan_ip, COL_FG, COL_BG, 1.0f);
+        y += CHAR_H(1.2f) + 2;
+
+        /* WiFi: icon + SSID + clients */
+        char ssid[64];
+        get_wifi_ssid(ssid, sizeof(ssid));
+        int clients = get_wifi_clients();
+
+        draw_wifi_icon(4, y, clients, COL_ACCENT);
+        int wx = 18;
+        if (strlen(ssid) > 14) ssid[14] = '\0';
+        wx = draw_str(wx, y, ssid, COL_FG, COL_BG, 1.2f);
+
+        /* client count right-aligned */
+        snprintf(tmp, sizeof(tmp), "%dSTA", clients);
+        draw_str_r(DISP_W - 4, y + 1, tmp, COL_ACCENT, COL_BG, 1.0f);
+        y += CHAR_H(1.2f) + 3;
+    }
+
+    /* dim separator */
+    fb_hline(4, y, DISP_W - 8, COL_DIM);
+    y += 5;
+
+    /* ── PERFORMANCE ──────────────────────────────────────── */
+    {
+        int cpu_pct = get_cpu_usage();
+        if (cpu_pct < 0) cpu_pct = 0;
+        int mem_used, mem_total;
+        get_memory(&mem_used, &mem_total);
+        int mem_pct = (mem_total > 0) ? (100 * mem_used / mem_total) : 0;
+        int dsk_pct = get_disk_usage_pct();
+
+        /* CPU bar */
+        draw_str(4, y, "CPU", COL_ACCENT, COL_BG, 1.0f);
+        {
+            uint16_t bc = (cpu_pct < 60) ? COL_GOOD :
+                          (cpu_pct < 85) ? COL_WARN : COL_BAD;
+            draw_progress_bar(30, y, 100, 8, cpu_pct, bc, COL_DIM);
+        }
+        snprintf(tmp, sizeof(tmp), "%d%%", cpu_pct);
+        draw_str(134, y, tmp, COL_FG, COL_BG, 1.0f);
+        y += 12;
+
+        /* MEM bar */
+        draw_str(4, y, "MEM", COL_ACCENT, COL_BG, 1.0f);
+        {
+            uint16_t mc = (mem_pct < 70) ? COL_GOOD :
+                          (mem_pct < 90) ? COL_WARN : COL_BAD;
+            draw_progress_bar(30, y, 100, 8, mem_pct, mc, COL_DIM);
+        }
+        snprintf(tmp, sizeof(tmp), "%d%%", mem_pct);
+        draw_str(134, y, tmp, COL_FG, COL_BG, 1.0f);
+        y += 12;
+
+        /* DSK bar */
+        if (dsk_pct >= 0) {
+            draw_str(4, y, "DSK", COL_ACCENT, COL_BG, 1.0f);
+            {
+                uint16_t dc = (dsk_pct < 70) ? COL_GOOD :
+                              (dsk_pct < 90) ? COL_WARN : COL_BAD;
+                draw_progress_bar(30, y, 100, 8, dsk_pct, dc, COL_DIM);
+            }
+            snprintf(tmp, sizeof(tmp), "%d%%", dsk_pct);
+            draw_str(134, y, tmp, COL_FG, COL_BG, 1.0f);
+            y += 12;
+        }
+    }
+    y += 2;
+
+    /* dim separator */
+    fb_hline(4, y, DISP_W - 8, COL_DIM);
+    y += 5;
+
+    /* ── TEMP + FAN ───────────────────────────────────────── */
+    {
+        /* CPU temp */
+        int cpu_c = get_cpu_temp();
+        draw_thermo_icon(4, y, COL_ACCENT);
+        if (cpu_c > 0) {
+            snprintf(tmp, sizeof(tmp), "%dC", cpu_c);
+            draw_str(12, y, tmp, temp_color(cpu_c), COL_BG, 1.3f);
+        }
+
+        /* Fan on same line, right side */
+        int rpm = get_fan_rpm();
+        int level = get_fan_level();
+        draw_fan_icon(DISP_W / 2 + 4, y, COL_ACCENT);
+        if (rpm >= 0) {
+            snprintf(tmp, sizeof(tmp), "%dRPM", rpm);
+            draw_str(DISP_W / 2 + 16, y, tmp, COL_FG, COL_BG, 1.0f);
+            if (level >= 0) {
+                snprintf(tmp, sizeof(tmp), "L%d", level);
+                draw_str_r(DISP_W - 4, y, tmp, COL_ACCENT, COL_BG, 1.0f);
+            }
+        } else {
+            draw_str(DISP_W / 2 + 16, y, "OFF", COL_DIM, COL_BG, 1.0f);
+        }
+        y += CHAR_H(1.3f) + 3;
+    }
+
+    /* dim separator */
+    fb_hline(4, y, DISP_W - 8, COL_DIM);
+    y += 5;
+
+    /* ── UPTIME ───────────────────────────────────────────── */
+    {
+        char upstr[32];
+        get_uptime_str(upstr, sizeof(upstr));
+        draw_arrow_up(4, y + 1, COL_DIM);
+        snprintf(tmp, sizeof(tmp), "Up %s", upstr);
+        draw_str(14, y, tmp, COL_DIM, COL_BG, 1.2f);
+    }
+
+    /* ── BOTTOM ACCENT LINE ───────────────────────────────── */
+    fb_hline(4, DISP_H - 3, DISP_W - 8, COL_ACCENT);
+    fb_hline(4, DISP_H - 1, DISP_W - 8, COL_ACCENT);
+}
+
+/* ================================================================== */
 /*  Top bar (always shown when no clock page)                          */
 /* ================================================================== */
 
@@ -1117,29 +2241,31 @@ static void render_screen(void)
 {
     fb_clear(COL_BG);
 
-    int y;
-    int has_clock_page = 0;
-
-    /* check if clock is a page (renders its own large time) */
-    for (int i = 0; i < cfg.num_pages; i++)
-        if (strcmp(cfg.pages[i], "clock") == 0) has_clock_page = 1;
-
-    /* top bar only if no clock page (clock page has its own big time) */
-    if (!has_clock_page)
-        y = render_topbar();
-    else
-        y = 2;
-
-    for (int i = 0; i < cfg.num_pages && y < DISP_H - 10; i++) {
-        const char *p = cfg.pages[i];
-        if      (strcmp(p, "clock")   == 0) y = render_clock(y);
-        else if (strcmp(p, "battery") == 0) y = render_battery(y);
-        else if (strcmp(p, "network") == 0) y = render_network(y);
-        else if (strcmp(p, "wifi")    == 0) y = render_wifi(y);
-        else if (strcmp(p, "thermal") == 0) y = render_thermal(y);
-        else if (strcmp(p, "system")  == 0) y = render_system(y);
-        else if (strcmp(p, "custom")  == 0) y = render_custom(y);
+    /* Dashboard mode: if first page is "dashboard", render single-screen HUD */
+    if (cfg.num_pages > 0 && strcmp(cfg.pages[0], "dashboard") == 0) {
+        render_dashboard();
+        return;
     }
+
+    /* Multi-page mode: show one page at a time */
+    if (page_idx >= cfg.num_pages) page_idx = 0;
+
+    const char *p = cfg.pages[page_idx];
+    if      (strcmp(p, "clock")    == 0) render_fullpage_clock();
+    else if (strcmp(p, "cellular") == 0) render_fullpage_cellular();
+    else if (strcmp(p, "battery")  == 0) render_fullpage_battery();
+    else if (strcmp(p, "network")  == 0) render_fullpage_network();
+    else if (strcmp(p, "system")   == 0) render_fullpage_system();
+    else if (strcmp(p, "wifi")     == 0) render_fullpage_network();
+    else if (strcmp(p, "thermal")  == 0) render_fullpage_system();
+    else if (strcmp(p, "custom")   == 0) { int y = 4; render_custom(y); }
+    else {
+        /* Unknown page - show name */
+        draw_str_c(DISP_H / 2, p, COL_DIM, COL_BG, 2.0f);
+    }
+
+    /* Page indicator dots */
+    draw_page_dots(page_idx, cfg.num_pages);
 }
 
 /* ================================================================== */
@@ -1149,7 +2275,27 @@ static void render_screen(void)
 static void sig_handler(int sig)
 {
     if (sig == SIGHUP) reload_cfg = 1;
+    else if (sig == SIGUSR1) dump_screenshot = 1;
     else running = 0;
+}
+
+/* Dump framebuffer as PPM (RGB888) to /tmp/pcat2-screenshot.ppm */
+static void fb_dump_ppm(void)
+{
+    FILE *f = fopen("/tmp/pcat2-screenshot.ppm", "wb");
+    if (!f) { perror("screenshot"); return; }
+    fprintf(f, "P6\n%d %d\n255\n", DISP_W, DISP_H);
+    for (int i = 0; i < DISP_W * DISP_H; i++) {
+        uint16_t val = ((uint16_t)fb[i*2] << 8) | fb[i*2+1];
+        /* BGR565: bits 15-11=B, 10-5=G, 4-0=R */
+        uint8_t r = (val & 0x1F) * 255 / 31;
+        uint8_t g = ((val >> 5) & 0x3F) * 255 / 63;
+        uint8_t b = ((val >> 11) & 0x1F) * 255 / 31;
+        uint8_t px[3] = { r, g, b };
+        fwrite(px, 1, 3, f);
+    }
+    fclose(f);
+    fprintf(stderr, "pcat2-display: screenshot saved to /tmp/pcat2-screenshot.ppm\n");
 }
 
 /* ================================================================== */
@@ -1310,6 +2456,7 @@ int main(void)
     signal(SIGTERM, sig_handler);
     signal(SIGINT,  sig_handler);
     signal(SIGHUP,  sig_handler);
+    signal(SIGUSR1, sig_handler);
 
     config_load();
 
@@ -1329,8 +2476,8 @@ int main(void)
             DC_BANK, DC_OFFSET, RST_BANK, RST_OFFSET, BL_BANK, BL_OFFSET);
 
     disp_init();
-    fprintf(stderr, "pcat2-display: display initialised (%dx%d) theme=%s refresh=%ds scale=%.1f\n",
-            DISP_W, DISP_H, cfg.theme, cfg.refresh, cfg.font_scale);
+    fprintf(stderr, "pcat2-display: display initialised (%dx%d) theme=%s refresh=%ds scale=%.1f pages=%d\n",
+            DISP_W, DISP_H, cfg.theme, cfg.refresh, cfg.font_scale, cfg.num_pages);
 
     /* apply initial backlight state */
     gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
@@ -1339,13 +2486,16 @@ int main(void)
     if (cfg.backlight)
         render_nyan_boot();
 
+    /* Open power button input device (grabs exclusively) */
+    input_init();
+
     while (running) {
         if (reload_cfg) {
             reload_cfg = 0;
             config_load();
             gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
-            fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d scale=%.1f\n",
-                    cfg.theme, cfg.refresh, cfg.backlight, cfg.font_scale);
+            fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d scale=%.1f pages=%d\n",
+                    cfg.theme, cfg.refresh, cfg.backlight, cfg.font_scale, cfg.num_pages);
         }
 
         if (cfg.backlight) {
@@ -1353,10 +2503,39 @@ int main(void)
             fb_flush();
         }
 
-        for (int i = 0; i < cfg.refresh * 10 && running && !reload_cfg; i++)
-            usleep(100000);
+        if (dump_screenshot) {
+            dump_screenshot = 0;
+            fb_dump_ppm();
+        }
+
+        for (int i = 0; i < cfg.refresh * 10 && running && !reload_cfg; i++) {
+            usleep(100000);     /* 100ms tick */
+
+            int btn = input_check();
+            if (btn == 1) {
+                /* Short press: cycle to next page */
+                page_idx = (page_idx + 1) % cfg.num_pages;
+                fprintf(stderr, "pcat2-display: page %d/%d (%s)\n",
+                        page_idx + 1, cfg.num_pages, cfg.pages[page_idx]);
+                if (cfg.backlight) {
+                    render_screen();
+                    fb_flush();
+                }
+            } else if (btn == 2) {
+                /* Long press (>=3s): power off */
+                fprintf(stderr, "pcat2-display: long press -> poweroff\n");
+                running = 0;
+                system("/sbin/poweroff");
+            }
+
+            if (dump_screenshot) {
+                dump_screenshot = 0;
+                fb_dump_ppm();
+            }
+        }
     }
 
+    if (input_fd >= 0) close(input_fd);
     disp_sleep();
 
     if (dc_line_fd  >= 0) close(dc_line_fd);

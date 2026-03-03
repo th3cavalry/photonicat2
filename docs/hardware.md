@@ -94,6 +94,19 @@
 | RST (Reset) | GPIO3_PD2 | bank 3 / offset 26 | Active LOW |
 | BL (Backlight) | GPIO3_C5 | bank 3 / offset 21 | **Active LOW** (LOW=on) |
 
+### Driver Features
+
+The `pcat2-display` daemon supports a multi-page user interface mirroring the
+factory firmware.  Short pressing the **power button** cycles through pages and a
+long press (≥3 s) initiates shutdown.  The pages are configurable via UCI
+(`display.pages`) and default to `clock`, `cellular`, `battery`, `network` and
+`system`.  Power button events are read from `/dev/input/event0` with an
+exclusive grab so the stock `/etc/rc.button/power` handler doesn't power off on
+short presses.
+
+(To revert to the single‑screen "dashboard" mode, set
+`display.pages='dashboard'`.)
+
 > **Note:** The backlight is active-LOW. The factory firmware uses PWM (`pwm@2ade2000`) with
 > inverted polarity. Since `CONFIG_PWM` is not enabled in OpenWrt's kernel config, we use
 > GPIO on/off (full brightness only).

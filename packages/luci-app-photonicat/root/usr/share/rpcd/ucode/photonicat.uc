@@ -244,7 +244,7 @@ const methods = {
 			if (a.theme && index(valid_themes, a.theme) < 0)
 				return { error: 'Invalid theme' };
 
-			let valid_pages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+			let valid_pages = ['dashboard', 'clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
 
 			let uci = cursor();
 			uci.load('photonicat');

@@ -407,8 +407,8 @@ return view.extend({
 
 	renderDisplayControls: function() {
 		var dc = this._displayConfig;
-		var allPages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
-		var activePages = dc.pages || ['clock', 'battery', 'network', 'wifi', 'thermal', 'system'];
+		var allPages = ['dashboard', 'clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+		var activePages = dc.pages || ['dashboard'];
 		var themes = ['dark', 'light', 'green', 'cyan', 'amber'];
 
 		/* Backlight toggle */
@@ -470,8 +470,11 @@ return view.extend({
 		}
 
 		/* Pages checkboxes */
+		/* note: when using the external display the power button cycles through
+		   pages in the order listed here (short press advances, hold ≥3s to power
+		   off) */
 		var pageLabels = {
-			clock: 'Clock', battery: 'Battery', network: 'Network',
+			dashboard: 'Dashboard', clock: 'Clock', battery: 'Battery', network: 'Network',
 			wifi: 'WiFi', thermal: 'Thermal', system: 'System', custom: 'Custom'
 		};
 		var pageChecks = [];
@@ -531,7 +534,7 @@ return view.extend({
 			refresh:    overrides.refresh || dc.refresh || 5,
 			theme:      overrides.theme || dc.theme || 'dark',
 			font_scale: (overrides.font_scale != null) ? overrides.font_scale : (dc.font_scale || 1.0),
-			pages:      overrides.pages || dc.pages || ['clock','battery','network','wifi','thermal','system']
+			pages:      overrides.pages || dc.pages || ['dashboard'],
 		};
 
 		/* Update local cache */
@@ -542,7 +545,7 @@ return view.extend({
 	},
 
 	handlePagesChange: function() {
-		var allPages = ['clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
+		var allPages = ['dashboard', 'clock', 'battery', 'network', 'wifi', 'thermal', 'system', 'custom'];
 		var selected = [];
 		for (var i = 0; i < allPages.length; i++) {
 			var cb = document.querySelector('input[data-page="' + allPages[i] + '"]');

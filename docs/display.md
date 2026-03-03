@@ -116,9 +116,14 @@ Built-in 5×7 bitmap font covering ASCII 0x20–0x7E, rendered at **2× scaling*
 
 ## Future Plans
 
-- [ ] Configurable display layouts (user-selectable screens)
-- [ ] Touch/button input for screen cycling
-- [ ] Brightness control (if PWM can be enabled)
-- [ ] Custom graphics/icons
-- [ ] Settings/configuration screen
-- [ ] Integration with MCU data (direct battery/temp from MCU instead of sysfs)
+The current firmware already provides a multi-page interface with power
+button cycling (short press to advance, long press to shut down).  The
+following enhancements remain:
+
+- [x] Configurable display layouts (user-selectable screens) – implemented via
+      UCI `display.pages`, default 5‑page set.
+- [x] Touch/button input for screen cycling – power button on `/dev/input/event0`.
+- [ ] Brightness control (if PWM can be enabled in kernel).
+- [ ] Custom graphics/icons beyond the 5×7 font.
+- [ ] Settings/configuration screen (e.g. WiFi setup, timezone).
+- [ ] Integration with MCU data (direct battery/temp from MCU instead of sysfs).
