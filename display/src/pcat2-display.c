@@ -147,7 +147,7 @@ struct config {
     int  backlight;                 /* 0=off, 1=on */
     int  refresh;                   /* seconds */
     char theme[16];
-    int  font_scale;                /* 1 or 2 */
+    float font_scale;               /* 1.0 - 2.0 */
 
     /* pages to show, in order */
     int  num_pages;
@@ -166,7 +166,7 @@ static void config_defaults(void)
     cfg.backlight  = 1;
     cfg.refresh    = 5;
     strncpy(cfg.theme, "dark", sizeof(cfg.theme));
-    cfg.font_scale = 1;
+    cfg.font_scale = 1.0f;
 
     /* default pages */
     cfg.num_pages = 6;
@@ -243,9 +243,9 @@ static void config_load(void)
         strncpy(cfg.theme, buf, sizeof(cfg.theme) - 1);
 
     if (uci_get("display.font_scale", buf, sizeof(buf)) == 0) {
-        cfg.font_scale = atoi(buf);
-        if (cfg.font_scale < 1) cfg.font_scale = 1;
-        if (cfg.font_scale > 3) cfg.font_scale = 3;
+        cfg.font_scale = strtof(buf, NULL);
+        if (cfg.font_scale < 1.0f) cfg.font_scale = 1.0f;
+        if (cfg.font_scale > 2.0f) cfg.font_scale = 2.0f;
     }
 
     /* pages list */
@@ -609,43 +609,51 @@ static void fb_flush(void)
 /*  Text rendering                                                     */
 /* ================================================================== */
 
-static void draw_char(int x, int y, char ch, uint16_t fg, uint16_t bg, int s)
+/* Character dimensions at a given scale */
+#define CHAR_W(s) ((int)(6.0f * (s)))
+#define CHAR_H(s) ((int)(8.0f * (s)))
+
+static void draw_char(int x, int y, char ch, uint16_t fg, uint16_t bg, float s)
 {
     if (ch < 0x20 || ch > 0x7E) ch = '?';
     const unsigned char *glyph = font5x7[ch - 0x20];
     for (int col = 0; col < 6; col++) {
         uint8_t bits = (col < 5) ? glyph[col] : 0;
+        int px0 = x + (int)(col * s);
+        int px1 = x + (int)((col + 1) * s);
         for (int row = 0; row < 8; row++) {
             uint16_t c = (row < 7 && (bits & (1 << row))) ? fg : bg;
-            for (int dy = 0; dy < s; dy++)
-                for (int dx = 0; dx < s; dx++)
-                    fb_pixel(x + col * s + dx, y + row * s + dy, c);
+            int py0 = y + (int)(row * s);
+            int py1 = y + (int)((row + 1) * s);
+            for (int py = py0; py < py1; py++)
+                for (int px = px0; px < px1; px++)
+                    fb_pixel(px, py, c);
         }
     }
 }
 
 static int draw_str(int x, int y, const char *str,
-                    uint16_t fg, uint16_t bg, int s)
+                    uint16_t fg, uint16_t bg, float s)
 {
     while (*str) {
         draw_char(x, y, *str, fg, bg, s);
-        x += 6 * s;
+        x += CHAR_W(s);
         str++;
     }
     return x;
 }
 
 static void draw_str_r(int xr, int y, const char *str,
-                       uint16_t fg, uint16_t bg, int s)
+                       uint16_t fg, uint16_t bg, float s)
 {
     int len = strlen(str);
-    draw_str(xr - len * 6 * s, y, str, fg, bg, s);
+    draw_str(xr - len * CHAR_W(s), y, str, fg, bg, s);
 }
 
 static void draw_str_c(int y, const char *str,
-                       uint16_t fg, uint16_t bg, int s)
+                       uint16_t fg, uint16_t bg, float s)
 {
-    int w = strlen(str) * 6 * s;
+    int w = strlen(str) * CHAR_W(s);
     draw_str((DISP_W - w) / 2, y, str, fg, bg, s);
 }
 
@@ -805,10 +813,10 @@ static int get_board_temp(void)
 
 static int section_header(int y, const char *title)
 {
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
     draw_str(4, y, title, COL_ACCENT, COL_BG, s);
-    fb_hline(4, y + 7 * s + 2, DISP_W - 8, COL_DIM);
-    return y + 8 * s + 4;
+    fb_hline(4, y + CHAR_H(s) + 2, DISP_W - 8, COL_DIM);
+    return y + CHAR_H(s) + 4;
 }
 
 /* pick colour by temperature */
@@ -831,12 +839,12 @@ static int render_clock(int y)
     char tmp[64];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     /* time in large font */
     snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
-    draw_str_c(y, tmp, COL_FG, COL_BG, 2 * s);
-    y += 16 * s + 2;
+    draw_str_c(y, tmp, COL_FG, COL_BG, 2.0f * s);
+    y += CHAR_H(2.0f * s) + 2;
 
     /* date */
     static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
@@ -845,7 +853,7 @@ static int render_clock(int y)
     snprintf(tmp, sizeof(tmp), "%s %s %02d, %d",
              wday[t->tm_wday], mon[t->tm_mon], t->tm_mday, t->tm_year + 1900);
     draw_str_c(y, tmp, COL_DIM, COL_BG, s);
-    y += 8 * s + 4;
+    y += CHAR_H(s) + 4;
 
     return y;
 }
@@ -853,7 +861,7 @@ static int render_clock(int y)
 static int render_battery(int y)
 {
     char tmp[64];
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     y = section_header(y, "BATTERY");
 
@@ -871,7 +879,7 @@ static int render_battery(int y)
     } else {
         draw_str(8, y, status, scol, COL_BG, s);
     }
-    y += 8 * s + 2;
+    y += CHAR_H(s) + 2;
 
     int mv = get_battery_voltage_mv();
     int ma = get_battery_current_ma();
@@ -882,7 +890,7 @@ static int render_battery(int y)
     else
         strncpy(tmp, "N/A", sizeof(tmp));
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 4;
+    y += CHAR_H(s) + 4;
 
     return y;
 }
@@ -890,7 +898,7 @@ static int render_battery(int y)
 static int render_network(int y)
 {
     char tmp[128];
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     y = section_header(y, "NETWORK");
 
@@ -906,11 +914,11 @@ static int render_network(int y)
     } else {
         draw_str(8, y, "No default route", COL_BAD, COL_BG, s);
     }
-    y += 8 * s + 2;
+    y += CHAR_H(s) + 2;
 
     snprintf(tmp, sizeof(tmp), "IP: %s", wan_ip);
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 4;
+    y += CHAR_H(s) + 4;
 
     return y;
 }
@@ -918,21 +926,21 @@ static int render_network(int y)
 static int render_wifi(int y)
 {
     char tmp[128];
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     y = section_header(y, "WIFI");
 
     char ssid[64];
     get_wifi_ssid(ssid, sizeof(ssid));
     draw_str(8, y, ssid, COL_FG, COL_BG, s);
-    y += 8 * s + 2;
+    y += CHAR_H(s) + 2;
 
     char bandchan[32];
     get_wifi_band_chan(bandchan, sizeof(bandchan));
     int clients = get_wifi_clients();
     snprintf(tmp, sizeof(tmp), "%s  %dSTA", bandchan, clients);
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 4;
+    y += CHAR_H(s) + 4;
 
     return y;
 }
@@ -940,7 +948,7 @@ static int render_wifi(int y)
 static int render_thermal(int y)
 {
     char tmp[64];
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     y = section_header(y, "THERMAL");
 
@@ -955,14 +963,14 @@ static int render_thermal(int y)
         snprintf(tmp, sizeof(tmp), "Fan: off");
     }
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 2;
+    y += CHAR_H(s) + 2;
 
     /* Board temp (MCU) */
     int bt = get_board_temp();
     if (bt >= 0) {
         snprintf(tmp, sizeof(tmp), "Board: %dC", bt);
         draw_str(8, y, tmp, temp_color(bt), COL_BG, s);
-        y += 8 * s + 2;
+        y += CHAR_H(s) + 2;
     }
 
     /* All thermal zones in compact 2-column grid */
@@ -997,7 +1005,7 @@ static int render_thermal(int y)
         draw_str(8, y, col1, (t1 >= 0) ? temp_color(t1) : COL_DIM, COL_BG, s);
         if (col2[0])
             draw_str(8 + DISP_W / 2, y, col2, (t2 >= 0) ? temp_color(t2) : COL_DIM, COL_BG, s);
-        y += 8 * s + 1;
+        y += CHAR_H(s) + 1;
     }
     y += 3;
 
@@ -1007,7 +1015,7 @@ static int render_thermal(int y)
 static int render_system(int y)
 {
     char tmp[64];
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     y = section_header(y, "SYSTEM");
 
@@ -1016,20 +1024,20 @@ static int render_system(int y)
     get_memory(&mem_used, &mem_total);
     snprintf(tmp, sizeof(tmp), "CPU %dC  Mem %d/%dM", cpu_c, mem_used, mem_total);
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 2;
+    y += CHAR_H(s) + 2;
 
     char upstr[32];
     get_uptime_str(upstr, sizeof(upstr));
     snprintf(tmp, sizeof(tmp), "Up: %s", upstr);
     draw_str(8, y, tmp, COL_FG, COL_BG, s);
-    y += 8 * s + 4;
+    y += CHAR_H(s) + 4;
 
     return y;
 }
 
 static int render_custom(int y)
 {
-    int s = cfg.font_scale;
+    float s = cfg.font_scale;
 
     if (cfg.num_custom == 0) return y;
 
@@ -1061,7 +1069,7 @@ static int render_custom(int y)
             snprintf(line, sizeof(line), "%s: %s", p->label, val);
 
         draw_str(8, y, line, COL_FG, COL_BG, s);
-        y += 8 * s + 2;
+        y += CHAR_H(s) + 2;
     }
     y += 2;
 
@@ -1075,8 +1083,8 @@ static int render_custom(int y)
 static int render_topbar(void)
 {
     char tmp[32];
-    int s = cfg.font_scale;
-    int bar_h = 16 * s + 2;
+    float s = cfg.font_scale;
+    int bar_h = CHAR_H(2.0f * s) + 2;
 
     fb_rect(0, 0, DISP_W, bar_h, COL_TOPBAR);
 
@@ -1084,14 +1092,14 @@ static int render_topbar(void)
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     snprintf(tmp, sizeof(tmp), "%02d:%02d", t->tm_hour, t->tm_min);
-    draw_str(4, 2 * s, tmp, COL_FG, COL_TOPBAR, s * 2);
+    draw_str(4, (int)(2.0f * s), tmp, COL_FG, COL_TOPBAR, 2.0f * s);
 
     /* battery % */
     int bpct = get_battery_pct();
     if (bpct >= 0) {
         snprintf(tmp, sizeof(tmp), "%d%%", bpct);
         uint16_t bcol = (bpct > 20) ? COL_GOOD : (bpct > 10 ? COL_WARN : COL_BAD);
-        draw_str_r(DISP_W - 4, 2 * s, tmp, bcol, COL_TOPBAR, s * 2);
+        draw_str_r(DISP_W - 4, (int)(2.0f * s), tmp, bcol, COL_TOPBAR, 2.0f * s);
     }
 
     /* separator lines */
@@ -1145,6 +1153,155 @@ static void sig_handler(int sig)
 }
 
 /* ================================================================== */
+/*  Nyan Cat boot logo                                                 */
+/* ================================================================== */
+
+/*
+ * 26x18 pixel Nyan Cat sprite with 6-frame rainbow trail animation.
+ * Palette indices map to RGB565 colours below.
+ * Rendered at 4x scale (104x72) centred on the 172x320 display.
+ */
+
+/* Colour palette */
+#define NC_BG    0   /* background (dark blue) */
+#define NC_RB_R  1   /* rainbow red */
+#define NC_RB_O  2   /* rainbow orange */
+#define NC_RB_Y  3   /* rainbow yellow */
+#define NC_RB_G  4   /* rainbow green */
+#define NC_RB_B  5   /* rainbow blue */
+#define NC_RB_V  6   /* rainbow violet */
+#define NC_TART  7   /* pop-tart body (tan) */
+#define NC_PINK  8   /* frosting (pink) */
+#define NC_SPRK  9   /* sprinkles (hot pink) */
+#define NC_CAT  10   /* cat body (dark grey) */
+#define NC_FACE 11   /* cat face (lighter grey) */
+#define NC_EYE  12   /* eyes (black) */
+#define NC_NOSE 13   /* cheeks (pink) */
+#define NC_STAR 14   /* stars (white) */
+#define NC_TAIL 15   /* cat tail stripe */
+#define NC__    NC_BG
+
+static const uint16_t nyan_palette[] = {
+    [NC_BG]   = RGB565(15,  15,  60),   /* dark navy */
+    [NC_RB_R] = RGB565(255, 0,   0),
+    [NC_RB_O] = RGB565(255, 153, 0),
+    [NC_RB_Y] = RGB565(255, 255, 51),
+    [NC_RB_G] = RGB565(51,  255, 51),
+    [NC_RB_B] = RGB565(51,  102, 255),
+    [NC_RB_V] = RGB565(102, 51,  204),
+    [NC_TART] = RGB565(220, 180, 120),
+    [NC_PINK] = RGB565(255, 153, 204),
+    [NC_SPRK] = RGB565(255, 51,  153),
+    [NC_CAT]  = RGB565(102, 102, 102),
+    [NC_FACE] = RGB565(153, 153, 153),
+    [NC_EYE]  = RGB565(20,  20,  20),
+    [NC_NOSE] = RGB565(255, 102, 153),
+    [NC_STAR] = RGB565(255, 255, 255),
+    [NC_TAIL] = RGB565(80,  80,  80),
+};
+
+/* 26 wide x 18 tall nyan cat sprite using palette indices */
+/* P=pink, T=tart, S=sprinkle, C=cat, F=face, E=eye, N=nose/cheek */
+static const uint8_t nyan_sprite[18][26] = {
+    /*                    rainbow trail              pop-tart + cat                     */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7,10, 0, 0, 0, 0, 0}, /* row  0 */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 8, 8, 8, 8, 8, 8, 7,10, 0, 0, 0, 0}, /* row  1 */
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 7, 8, 9, 8, 8, 8, 9, 8, 8, 7, 0, 0, 0, 0}, /* row  2 */
+    {2, 2, 2, 2, 2, 2, 2, 2, 2, 0,10, 0, 7, 8, 8, 8, 9, 8, 8, 8, 8, 7, 0, 0, 0, 0}, /* row  3 */
+    {3, 3, 3, 3, 3, 3, 3, 3, 3, 0,10,10, 7, 8, 8, 8, 8, 8, 8, 9, 8, 7, 0, 0, 0, 0}, /* row  4 */
+    {4, 4, 4, 4, 4, 4, 4, 4, 4, 0,10,11,11,11, 7, 7, 7, 7, 7, 7, 7, 7,11,11, 0, 0}, /* row  5 */
+    {5, 5, 5, 5, 5, 5, 5, 5, 5, 0,10,11,12,11,11,11,11,11,11,11,11,11,11,12,11, 0}, /* row  6 */
+    {6, 6, 6, 6, 6, 6, 6, 6, 6, 0,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11, 0}, /* row  7 */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0,10,11,11,13,11,11,11,11,11,11,11,11,13,11,11, 0}, /* row  8 */
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0,10,11,11,11,11,11,11,11,11,11,11,11,11,10, 0}, /* row  9 */
+    {2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0,10,10, 7, 7, 7, 7, 7, 7, 7,10,10, 0, 0, 0}, /* row 10 */
+    {3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 7, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 7, 0, 0, 0}, /* row 11 */
+    {4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 7, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 7, 0, 0, 0}, /* row 12 */
+    {5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 7, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 7, 0, 0, 0}, /* row 13 */
+    {6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 7, 8, 8, 8, 9, 8, 8, 8, 8, 7, 0, 0, 0, 0}, /* row 14 */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 8, 8, 8, 8, 8, 8, 8, 7, 0, 0, 0, 0}, /* row 15 */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0, 0}, /* row 16 */
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,10, 0, 0, 0, 0,10, 0, 0, 0, 0, 0, 0}, /* row 17: feet */
+};
+
+#define NYAN_W  26
+#define NYAN_H  18
+#define NYAN_SCALE 5   /* 5x scale: 130x90 pixels, fits nicely on 172x320 */
+
+/* Animated star positions for twinkling effect */
+static const struct { int x; int y; } nyan_stars[] = {
+    {10, 40}, {150, 20}, {30, 120}, {155, 100}, {5, 200}, {160, 180},
+    {20, 260}, {140, 240}, {45, 300}, {130, 290}, {80, 15}, {95, 305},
+};
+#define NUM_STARS 12
+
+static void render_nyan_boot(void)
+{
+    uint16_t bg = nyan_palette[NC_BG];
+    int sx = (DISP_W - NYAN_W * NYAN_SCALE) / 2;    /* centre X */
+    int sy = (DISP_H - NYAN_H * NYAN_SCALE) / 2;    /* centre Y */
+
+    /* 3-frame animation: nyan bobs up/down while stars twinkle */
+    for (int frame = 0; frame < 8; frame++) {
+        fb_clear(bg);
+
+        /* Draw twinkling stars */
+        for (int i = 0; i < NUM_STARS; i++) {
+            /* Each star twinkles at a different phase */
+            int phase = (frame + i) % 4;
+            if (phase < 2) {
+                uint16_t sc = (phase == 0) ? nyan_palette[NC_STAR] :
+                              RGB565(180, 180, 200);
+                int sz = (phase == 0) ? 3 : 2;
+                /* draw small cross shape for star */
+                for (int d = -sz; d <= sz; d++) {
+                    fb_pixel(nyan_stars[i].x + d, nyan_stars[i].y, sc);
+                    fb_pixel(nyan_stars[i].x, nyan_stars[i].y + d, sc);
+                }
+            }
+        }
+
+        /* Bob offsets */
+        int bob_y = (frame % 2 == 0) ? 0 : -3;
+
+        /* Rainbow trail offset cycling */
+        int rb_phase = frame % 3;
+
+        /* Draw sprite */
+        for (int row = 0; row < NYAN_H; row++) {
+            for (int col = 0; col < NYAN_W; col++) {
+                uint8_t idx = nyan_sprite[row][col];
+                if (idx == NC_BG) continue;
+
+                /* Cycle rainbow colours for the trail columns */
+                if (col < 9 && idx >= NC_RB_R && idx <= NC_RB_V) {
+                    int rb = (idx - NC_RB_R + rb_phase) % 6 + NC_RB_R;
+                    idx = rb;
+                }
+
+                uint16_t c = nyan_palette[idx];
+                int px = sx + col * NYAN_SCALE;
+                int py = sy + row * NYAN_SCALE + bob_y;
+                fb_rect(px, py, NYAN_SCALE, NYAN_SCALE, c);
+            }
+        }
+
+        /* "NYAN!" text below */
+        float ts = 2.0f;
+        const char *msg = "NYAN!";
+        int tw = strlen(msg) * CHAR_W(ts);
+        draw_str((DISP_W - tw) / 2, sy + NYAN_H * NYAN_SCALE + 15 + bob_y,
+                 msg, nyan_palette[NC_PINK], bg, ts);
+
+        fb_flush();
+        usleep(200000);  /* 200ms per frame */
+    }
+
+    /* Hold final frame briefly */
+    usleep(400000);
+}
+
+/* ================================================================== */
 /*  main                                                               */
 /* ================================================================== */
 
@@ -1172,19 +1329,23 @@ int main(void)
             DC_BANK, DC_OFFSET, RST_BANK, RST_OFFSET, BL_BANK, BL_OFFSET);
 
     disp_init();
-    fprintf(stderr, "pcat2-display: display initialised (%dx%d) theme=%s refresh=%ds\n",
-            DISP_W, DISP_H, cfg.theme, cfg.refresh);
+    fprintf(stderr, "pcat2-display: display initialised (%dx%d) theme=%s refresh=%ds scale=%.1f\n",
+            DISP_W, DISP_H, cfg.theme, cfg.refresh, cfg.font_scale);
 
     /* apply initial backlight state */
     gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
+
+    /* Nyan Cat boot animation! */
+    if (cfg.backlight)
+        render_nyan_boot();
 
     while (running) {
         if (reload_cfg) {
             reload_cfg = 0;
             config_load();
             gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
-            fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d\n",
-                    cfg.theme, cfg.refresh, cfg.backlight);
+            fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d scale=%.1f\n",
+                    cfg.theme, cfg.refresh, cfg.backlight, cfg.font_scale);
         }
 
         if (cfg.backlight) {

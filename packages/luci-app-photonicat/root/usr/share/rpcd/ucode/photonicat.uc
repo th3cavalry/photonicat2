@@ -211,7 +211,7 @@ const methods = {
 				backlight:  +(uci.get('photonicat', 'display', 'backlight') || '1'),
 				refresh:    +(uci.get('photonicat', 'display', 'refresh') || '5'),
 				theme:      uci.get('photonicat', 'display', 'theme') || 'dark',
-				font_scale: +(uci.get('photonicat', 'display', 'font_scale') || '1'),
+				font_scale: +(uci.get('photonicat', 'display', 'font_scale') || '1.0'),
 				pages:      uci.get('photonicat', 'display', 'pages') || ['clock','battery','network','wifi','thermal','system']
 			};
 
@@ -236,7 +236,7 @@ const methods = {
 	},
 
 	set_display_config: {
-		args: { backlight: 0, refresh: 0, theme: '', font_scale: 0, pages: [] },
+		args: { backlight: 0, refresh: 0, theme: '', font_scale: 0.0, pages: [] },
 		call: function(req) {
 			let a = req.args;
 
@@ -263,8 +263,8 @@ const methods = {
 			if (a.theme)
 				uci.set('photonicat', 'display', 'theme', a.theme);
 
-			if (a.font_scale != null && a.font_scale >= 1 && a.font_scale <= 3)
-				uci.set('photonicat', 'display', 'font_scale', '' + a.font_scale);
+			if (a.font_scale != null && +a.font_scale >= 1.0 && +a.font_scale <= 2.0)
+				uci.set('photonicat', 'display', 'font_scale', sprintf('%.1f', +a.font_scale));
 
 			if (a.pages && length(a.pages) > 0) {
 				// Validate pages

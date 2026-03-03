@@ -458,12 +458,14 @@ return view.extend({
 			'class': 'cbi-input-select',
 			'id': 'disp-scale',
 			'change': L.bind(function(ev) {
-				this.handleDisplayApply({ font_scale: parseInt(ev.target.value) });
+				this.handleDisplayApply({ font_scale: parseFloat(ev.target.value) });
 			}, this)
 		});
-		for (var s = 1; s <= 3; s++) {
-			var sopt = E('option', { 'value': String(s) }, s + 'x');
-			if (s === (dc.font_scale || 1)) sopt.selected = true;
+		var scaleValues = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0];
+		for (var si = 0; si < scaleValues.length; si++) {
+			var sv = scaleValues[si];
+			var sopt = E('option', { 'value': String(sv) }, sv.toFixed(1) + 'x');
+			if (Math.abs(sv - (dc.font_scale || 1.0)) < 0.05) sopt.selected = true;
 			scaleSelect.appendChild(sopt);
 		}
 
@@ -528,7 +530,7 @@ return view.extend({
 			backlight:  (overrides.backlight != null) ? overrides.backlight : dc.backlight,
 			refresh:    overrides.refresh || dc.refresh || 5,
 			theme:      overrides.theme || dc.theme || 'dark',
-			font_scale: overrides.font_scale || dc.font_scale || 1,
+			font_scale: (overrides.font_scale != null) ? overrides.font_scale : (dc.font_scale || 1.0),
 			pages:      overrides.pages || dc.pages || ['clock','battery','network','wifi','thermal','system']
 		};
 
