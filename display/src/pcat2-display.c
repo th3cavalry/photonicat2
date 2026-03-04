@@ -149,6 +149,8 @@ struct config {
     int  backlight;                 /* 0=off, 1=on */
     int  refresh;                   /* seconds */
     int  poweroff_ms;               /* length of press to trigger shutdown */
+    int  screen_off_battery;        /* seconds idle before screen off on battery (0=never) */
+    int  screen_off_ac;             /* seconds idle before screen off on AC/charger (0=never) */
     char theme[16];
     float font_scale;               /* 1.0 - 2.0 */
 
@@ -168,7 +170,9 @@ static void config_defaults(void)
 {
     cfg.backlight  = 1;
     cfg.refresh    = 5;
-    cfg.poweroff_ms = 1000;          /* default 1 second long-press to shutdown */
+    cfg.poweroff_ms = 2000;          /* default 2 second long-press to shutdown */
+    cfg.screen_off_battery = 30;     /* turn screen off after 30s idle on battery */
+    cfg.screen_off_ac      = 0;      /* never auto-off when plugged in */
     strncpy(cfg.theme, "dark", sizeof(cfg.theme));
     cfg.font_scale = 1.0f;
 
@@ -246,6 +250,16 @@ static void config_load(void)
         cfg.poweroff_ms = atoi(buf);
         if (cfg.poweroff_ms < 100) cfg.poweroff_ms = 100;
         if (cfg.poweroff_ms > 30000) cfg.poweroff_ms = 30000;
+    }
+
+    if (uci_get("display.screen_off_battery", buf, sizeof(buf)) == 0) {
+        cfg.screen_off_battery = atoi(buf);
+        if (cfg.screen_off_battery < 0) cfg.screen_off_battery = 0;
+    }
+
+    if (uci_get("display.screen_off_ac", buf, sizeof(buf)) == 0) {
+        cfg.screen_off_ac = atoi(buf);
+        if (cfg.screen_off_ac < 0) cfg.screen_off_ac = 0;
     }
 
     if (uci_get("display.theme", buf, sizeof(buf)) == 0)
@@ -404,6 +418,10 @@ static int rst_line_fd = -1;
 static int bl_line_fd  = -1;
 static int input_fd    = -1;
 static int page_idx    = 0;
+
+/* Screen auto-off state */
+static struct timespec last_activity;  /* monotonic time of last button press */
+static int screen_asleep = 0;          /* 1 = backlight off due to idle timeout */
 
 static uint8_t fb[DISP_W * DISP_H * 2];
 
@@ -900,6 +918,14 @@ static void get_battery_status(char *buf, size_t len)
 {
     if (read_sysfs("/sys/class/power_supply/battery/status", buf, len) < 0)
         strncpy(buf, "N/A", len);
+}
+
+/* Returns 1 if on AC/charger, 0 if on battery */
+static int is_on_ac(void)
+{
+    char buf[32];
+    get_battery_status(buf, sizeof(buf));
+    return (strstr(buf, "Charging") || strstr(buf, "Full")) ? 1 : 0;
 }
 
 static int get_battery_voltage_mv(void)
@@ -2497,16 +2523,25 @@ int main(void)
     /* Open power button input device (grabs exclusively) */
     input_init();
 
+    /* Initialise activity timer for screen auto-off */
+    clock_gettime(CLOCK_MONOTONIC, &last_activity);
+    screen_asleep = 0;
+
+    fprintf(stderr, "pcat2-display: screen_off: battery=%ds ac=%ds  poweroff_ms=%d\n",
+            cfg.screen_off_battery, cfg.screen_off_ac, cfg.poweroff_ms);
+
     while (running) {
         if (reload_cfg) {
             reload_cfg = 0;
             config_load();
             gpio_set(bl_line_fd, cfg.backlight ? 0 : 1);
+            screen_asleep = 0;
+            clock_gettime(CLOCK_MONOTONIC, &last_activity);
             fprintf(stderr, "pcat2-display: config reloaded theme=%s refresh=%ds bl=%d scale=%.1f pages=%d\n",
                     cfg.theme, cfg.refresh, cfg.backlight, cfg.font_scale, cfg.num_pages);
         }
 
-        if (cfg.backlight) {
+        if (cfg.backlight && !screen_asleep) {
             render_screen();
             fb_flush();
         }
@@ -2519,9 +2554,33 @@ int main(void)
         for (int i = 0; i < cfg.refresh * 10 && running && !reload_cfg; i++) {
             usleep(100000);     /* 100ms tick */
 
+            /* Check screen auto-off timeout */
+            if (cfg.backlight && !screen_asleep) {
+                int timeout = is_on_ac() ? cfg.screen_off_ac : cfg.screen_off_battery;
+                if (timeout > 0) {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    long idle_s = now.tv_sec - last_activity.tv_sec;
+                    if (idle_s >= timeout) {
+                        screen_asleep = 1;
+                        gpio_set(bl_line_fd, 1);  /* backlight OFF (active-low) */
+                        fprintf(stderr, "pcat2-display: screen auto-off after %lds idle\n", idle_s);
+                    }
+                }
+            }
+
             int btn = input_check();
-            if (btn == 1) {
+            if (btn > 0 && screen_asleep) {
+                /* Any press wakes the screen; consume the press */
+                screen_asleep = 0;
+                clock_gettime(CLOCK_MONOTONIC, &last_activity);
+                gpio_set(bl_line_fd, 0);  /* backlight ON */
+                fprintf(stderr, "pcat2-display: screen wake\n");
+                render_screen();
+                fb_flush();
+            } else if (btn == 1) {
                 /* Short press: cycle to next page */
+                clock_gettime(CLOCK_MONOTONIC, &last_activity);
                 page_idx = (page_idx + 1) % cfg.num_pages;
                 fprintf(stderr, "pcat2-display: page %d/%d (%s)\n",
                         page_idx + 1, cfg.num_pages, cfg.pages[page_idx]);

@@ -98,11 +98,16 @@
 
 The `pcat2-display` daemon supports a multi-page user interface mirroring the
 factory firmware.  Short pressing the **power button** cycles through pages and a
-long press (default 1 s, configurable via `display.poweroff_ms`) initiates
+long press (default 2 s, configurable via `display.poweroff_ms`) initiates
 shutdown.  The pages are configurable via UCI (`display.pages`) and default
 to `clock`, `cellular`, `battery`, `network` and `system`.  Power button events
 are read from `/dev/input/event0` with an exclusive grab so the stock
 `/etc/rc.button/power` handler doesn't power off on short presses.
+
+The screen automatically turns off after a configurable idle timeout to save
+power.  Pressing the power button wakes the screen without cycling pages.
+Defaults: **30 s on battery** (`display.screen_off_battery`), **never on AC**
+(`display.screen_off_ac`).  Set to `0` to disable auto-off.
 
 (To revert to the single‑screen "dashboard" mode, set
 `display.pages='dashboard'`.)
