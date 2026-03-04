@@ -78,6 +78,23 @@ Our upstream OpenWrt PR adds full board support:
 - **PR:** [openwrt/openwrt#22246](https://github.com/openwrt/openwrt/pull/22246)
 - **Branch:** `add-ariaboard-photonicat-2`
 
+### Prebuilt Images & Flashing
+
+Precompiled OpenWrt images are published on this project's GitHub releases page. Look for
+`ariaboard_photonicat-2-*.img` and `*-sysupgrade.bin` files under the appropriate tag:
+
+```
+https://github.com/th3cavalry/photonicat2/releases/download/vX.Y/ariaboard_photonicat-2-squashfs-sdcard.img
+https://github.com/th3cavalry/photonicat2/releases/download/vX.Y/ariaboard_photonicat-2-squashfs-sysupgrade.bin
+```
+
+Flash the SD card image with `dd` or `balenaEtcher`, then use the sysupgrade file
+for subsequent updates.
+
+To build your own, follow the instructions in the "Building" section above or run a
+full OpenWrt build as described in [`docs/hardware.md`](docs/hardware.md).
+
+
 ## Building
 
 ### Display application (standalone)

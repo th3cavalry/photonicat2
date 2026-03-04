@@ -126,10 +126,15 @@ The display uses the **Linux GPIO chardev v2 API** (`GPIO_V2_GET_LINE_IOCTL`, `G
 | UART | UART10 (`serial@2adc0000`) |
 | Baud rate | 115200 |
 | Protocol | Binary framed with CRC16 (see [mcu-protocol.md](mcu-protocol.md)) |
-| DT compatible | `photonicat-pm` |
+| DT compatible | `photonicat-pm` (no kernel driver; handled by userspace
+| | library `mcu/pcat2-mcu.c`) |
 | PM version | 2 |
 | Features | Battery, charger, fan, RTC, temperature, accelerometer, power control |
 | Power GPIO | GPIO for MCU shutdown signaling |
+
+*The original OpenWrt patch added a kernel staging driver (`photonicat-pm`),
+but it was later replaced by the open‑source userspace implementation.  See
+`mcu-protocol.md` for protocol details and `mcu/` for the library code.*
 
 ## PCIe
 
@@ -165,3 +170,39 @@ The display uses the **Linux GPIO chardev v2 API** (`GPIO_V2_GET_LINE_IOCTL`, `G
 | Bootloader | U-Boot (generic-rk3576) |
 | Boot media | SD card (primary for OpenWrt), eMMC |
 | SD card quirk | RK3576 BootROM has an issue with SD card boot; U-Boot mkimage patch 116-7 works around it |
+
+## OpenWrt images & flashing
+
+Pre‑built OpenWrt firmware for the Photonicat 2 can be downloaded from the
+GitHub releases page for this project.  For example:
+
+```
+https://github.com/th3cavalry/photonicat2/releases/download/vX.Y/ariaboard_photonicat-2-squashfs-sdcard.img
+https://github.com/th3cavalry/photonicat2/releases/download/vX.Y/ariaboard_photonicat-2-squashfs-sysupgrade.bin
+```
+
+(Replace `vX.Y` with the desired release tag.)
+
+To build your own images from source:
+
+```sh
+cd openwrt
+# fetch feeds and dependencies if running outside the project tree
+./scripts/feeds update -a && ./scripts/feeds install -a
+make defconfig
+make menuconfig   # Target System: Rockchip, Subtarget: armv8, Device: ariaboard_photonicat-2
+make -j$(nproc) V=s
+```
+
+Resulting firmware files will appear under
+`bin/targets/rockchip/armv8/` (the SD‑card image is named
+`*-sdcard.img`, sysupgrade file is `*-sysupgrade.bin`).  Flash the SD image
+with `dd` or `balenaEtcher`, and upgrade later with `sysupgrade`.
+
+### Flashing notes
+
+* Always verify the image with `sha256sum` before writing.
+* If you ever brick the eMMC, boot the SD card image and use `dd` to write
+the sysupgrade file directly to `/dev/mmcblk0`.
+* The stock bootloader enforces a 4 MB alignment; use the provided
+`amiibo` wrapper or the flash scripts in `openwrt/scripts/`.
