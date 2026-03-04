@@ -117,8 +117,8 @@ Built-in 5×7 bitmap font covering ASCII 0x20–0x7E, rendered at **2× scaling*
 ## Future Plans
 
 The current firmware already provides a multi-page interface with power
-button cycling (short press to advance, long press to shut down).  The
-following enhancements remain:
+button cycling (short press to advance, configurable long-press duration to
+shut down).  The following enhancements remain:
 
 - [x] Configurable display layouts (user-selectable screens) – implemented via
       UCI `display.pages`, default 5‑page set.

@@ -148,6 +148,7 @@ struct custom_param {
 struct config {
     int  backlight;                 /* 0=off, 1=on */
     int  refresh;                   /* seconds */
+    int  poweroff_ms;               /* length of press to trigger shutdown */
     char theme[16];
     float font_scale;               /* 1.0 - 2.0 */
 
@@ -167,6 +168,7 @@ static void config_defaults(void)
 {
     cfg.backlight  = 1;
     cfg.refresh    = 5;
+    cfg.poweroff_ms = 1000;          /* default 1 second long-press to shutdown */
     strncpy(cfg.theme, "dark", sizeof(cfg.theme));
     cfg.font_scale = 1.0f;
 
@@ -238,6 +240,12 @@ static void config_load(void)
         cfg.refresh = atoi(buf);
         if (cfg.refresh < 1) cfg.refresh = 1;
         if (cfg.refresh > 60) cfg.refresh = 60;
+    }
+
+    if (uci_get("display.poweroff_ms", buf, sizeof(buf)) == 0) {
+        cfg.poweroff_ms = atoi(buf);
+        if (cfg.poweroff_ms < 100) cfg.poweroff_ms = 100;
+        if (cfg.poweroff_ms > 30000) cfg.poweroff_ms = 30000;
     }
 
     if (uci_get("display.theme", buf, sizeof(buf)) == 0)
@@ -510,7 +518,7 @@ static void input_init(void)
     fprintf(stderr, "pcat2-display: power button input ready\n");
 }
 
-/* Returns: 1 = short press, 2 = long press (>=3s), 0 = nothing */
+/* Returns: 1 = short press, 2 = long press (>= cfg.poweroff_ms ms), 0 = nothing */
 static int input_check(void)
 {
     if (input_fd < 0) return 0;
@@ -531,7 +539,7 @@ static int input_check(void)
             clock_gettime(CLOCK_MONOTONIC, &now);
             long ms = (now.tv_sec - press_ts.tv_sec) * 1000 +
                       (now.tv_nsec - press_ts.tv_nsec) / 1000000;
-            result = (ms >= 3000) ? 2 : 1;
+            result = (ms >= cfg.poweroff_ms) ? 2 : 1;
         }
     }
 
@@ -541,7 +549,7 @@ static int input_check(void)
         clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - press_ts.tv_sec) * 1000 +
                   (now.tv_nsec - press_ts.tv_nsec) / 1000000;
-        if (ms >= 3000) { pressed = 0; result = 2; }
+        if (ms >= cfg.poweroff_ms) { pressed = 0; result = 2; }
     }
 
     return result;
@@ -2522,7 +2530,7 @@ int main(void)
                     fb_flush();
                 }
             } else if (btn == 2) {
-                /* Long press (>=3s): power off */
+                /* Long press (>= cfg.poweroff_ms ms): power off */
                 fprintf(stderr, "pcat2-display: long press -> poweroff\n");
                 running = 0;
                 system("/sbin/poweroff");
